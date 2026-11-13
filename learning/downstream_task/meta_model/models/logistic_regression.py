@@ -29,6 +29,7 @@ class LogisticMetaRegressorModel(BaseMetaRegressor):
         if params:
             default_params.update(params)
         super().__init__(name="logistic_regression", params=default_params)
+        self._constant_prob: Optional[float] = None
 
     def fit(
         self,
@@ -56,18 +57,33 @@ class LogisticMetaRegressorModel(BaseMetaRegressor):
         w_dup = np.concatenate([w_arr * y_arr, w_arr * (1.0 - y_arr)])
 
         valid_mask = w_dup > 1e-12
+        y_fit = y_dup[valid_mask]
+        unique_classes = np.unique(y_fit)
+        if len(y_fit) == 0 or len(unique_classes) < 2:
+            self.model = None
+            const_val = float(unique_classes[0]) if len(unique_classes) == 1 else float(np.nanmean(y_arr))
+            self._constant_prob = float(np.clip(const_val if np.isfinite(const_val) else 0.5, 0.0, 1.0))
+            return self
+
+        self._constant_prob = None
         self.model = LogisticRegression(**self.params)
-        self.model.fit(X_dup[valid_mask], y_dup[valid_mask], sample_weight=w_dup[valid_mask])
+        self.model.fit(X_dup[valid_mask], y_fit, sample_weight=w_dup[valid_mask])
         return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
+        X_arr = np.asarray(X, dtype=np.float64)
+        if self._constant_prob is not None:
+            return np.full(len(X_arr), self._constant_prob, dtype=np.float64)
         if self.model is None:
             raise RuntimeError("LogisticMetaRegressorModel は未学習です。")
-        X_arr = np.asarray(X, dtype=np.float64)
         preds = self.model.predict_proba(X_arr)[:, 1]
         return np.clip(np.asarray(preds, dtype=np.float64).ravel(), 0.0, 1.0)
 
     def get_coefficients(self) -> Dict[str, float]:
+        if self._constant_prob is not None:
+            res = {fname: 0.0 for fname in self.feature_names}
+            res["intercept"] = float(self._constant_prob)
+            return res
         if self.model is None or not hasattr(self.model, "coef_"):
             return {}
         coefs = self.model.coef_.ravel()

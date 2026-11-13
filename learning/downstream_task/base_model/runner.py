@@ -22,6 +22,7 @@ try:
     )
     from ..metrics import compute_fold_metrics, compute_oof_and_fold_summary
     from ..pls import DualStreamPLS
+    from ..threshold_decision.criteria import find_optimal_threshold, normalize_criterion_name
     from .models import create_base_model, normalize_base_model_name
     from .reporter import generate_visualizations, save_markdown_report
 except (ImportError, ValueError):
@@ -32,6 +33,7 @@ except (ImportError, ValueError):
     )
     from downstream_task.metrics import compute_fold_metrics, compute_oof_and_fold_summary
     from downstream_task.pls import DualStreamPLS
+    from downstream_task.threshold_decision.criteria import find_optimal_threshold, normalize_criterion_name
     from downstream_task.base_model.models import create_base_model, normalize_base_model_name
     from downstream_task.base_model.reporter import generate_visualizations, save_markdown_report
 
@@ -54,6 +56,8 @@ class LOSOFoldData:
     sample_weights_train: np.ndarray
     sample_weights_test: np.ndarray
     y_true_test: np.ndarray
+    optimal_threshold: float = 0.5
+    threshold_criterion: str = "youden_j"
 
 
 def prepare_loso_folds(
@@ -69,6 +73,7 @@ def prepare_loso_folds(
     cov_type: str = "full",
     weights: Tuple[float, float] = (1.0, 0.0),
     apply_subject_norm: bool = True,
+    compute_thresholds: bool = True,
 ) -> Tuple[List[LOSOFoldData], List[str], List[str], np.ndarray, np.ndarray]:
     """
     全 LOSO Fold について、テスト被験者を完全除外したリークフリーな手順で
@@ -86,12 +91,22 @@ def prepare_loso_folds(
     loso_cfg = cfg.get("loso_cv", {}) if cfg else {}
     bm_cfg = dt_cfg.get("base_model", {})
     es_cfg = bm_cfg.get("early_stopping", {})
+    th_cfg = dt_cfg.get("threshold_decision", {})
 
     seed = int(loso_cfg.get("random_state", dt_cfg.get("random_state", 42)))
     imbalance_penalty = float(dt_cfg.get("imbalance_penalty", 4.0))
     use_explicit = bool(dt_cfg.get("use_explicit_features", True))
     val_ratio = float(es_cfg.get("val_ratio", 0.2))
     group_split = bool(es_cfg.get("group_split", True))
+
+    th_enabled = bool(th_cfg.get("enabled", True))
+    th_criterion = normalize_criterion_name(th_cfg.get("default_criterion", "youden_j"))
+    th_sr = th_cfg.get("search_range", [0.05, 0.95])
+    th_search_range: Tuple[float, float] = (float(th_sr[0]), float(th_sr[1]))
+    th_search_step = float(th_cfg.get("search_step", 0.005))
+    th_use_exact = bool(th_cfg.get("use_exact_curve_points", True))
+    th_fallback = float(th_cfg.get("fallback_threshold", 0.5))
+    th_split_mode = str(th_cfg.get("validation_split_mode", "train_oof")).strip().lower()
 
     subjects = meta_df[subject_col].astype(str).values
     labels = meta_df[label_col].values.astype(float)
@@ -128,11 +143,23 @@ def prepare_loso_folds(
 
         # A. Fold 内 DualStream PLS
         if actual_vis_comps < emb_vis.shape[1] or actual_bio_comps < emb_bio.shape[1]:
+            if fold == 1 and log is not None:
+                log.info(
+                    f"✓ Fold 内 DualStream PLS を実行します "
+                    f"(Visual: {emb_vis.shape[1]}d -> {actual_vis_comps}d, "
+                    f"Vital: {emb_bio.shape[1]}d -> {actual_bio_comps}d)"
+                )
             pls = DualStreamPLS(n_vis=actual_vis_comps, n_bio=actual_bio_comps)
             pls.fit(emb_vis[train_idx], emb_bio[train_idx], labels[train_idx])
             z_train = pls.transform(emb_vis[train_idx], emb_bio[train_idx])
             z_test = pls.transform(emb_vis[test_idx], emb_bio[test_idx])
         else:
+            if fold == 1 and log is not None:
+                log.warning(
+                    f"⚠️ 入力埋め込み次元 (Visual={emb_vis.shape[1]}d, Vital={emb_bio.shape[1]}d) が "
+                    f"PLS目標次元 ({actual_vis_comps}d, {actual_bio_comps}d) 以下のため、"
+                    f"Fold 内 DualStream PLS をスキップします。"
+                )
             z_train = np.concatenate([emb_vis[train_idx], emb_bio[train_idx]], axis=1).astype(np.float32)
             z_test = np.concatenate([emb_vis[test_idx], emb_bio[test_idx]], axis=1).astype(np.float32)
 
@@ -209,6 +236,28 @@ def prepare_loso_folds(
             inner_tr_mask[tr_sub] = True
             inner_val_mask[val_sub] = True
 
+        # F. 学習前 閾値決定 (Youden's J Index = Balanced Accuracy 最大化)
+        if th_enabled and compute_thresholds:
+            if th_split_mode == "group_val" and inner_val_mask.any():
+                y_th_true = labels[train_idx][inner_val_mask]
+                y_th_pred = y_soft_train[inner_val_mask]
+            else:
+                y_th_true = labels[train_idx]
+                y_th_pred = y_soft_train
+
+            th_res = find_optimal_threshold(
+                y_true=y_th_true,
+                y_pred=y_th_pred,
+                criterion=th_criterion,
+                search_range=th_search_range,
+                search_step=th_search_step,
+                use_exact_curve_points=th_use_exact,
+                fallback_threshold=th_fallback,
+            )
+            optimal_th = float(th_res.optimal_threshold)
+        else:
+            optimal_th = float(th_fallback)
+
         folds_data.append(
             LOSOFoldData(
                 fold=fold,
@@ -226,7 +275,18 @@ def prepare_loso_folds(
                 sample_weights_train=sample_weights_train,
                 sample_weights_test=sample_weights_test,
                 y_true_test=labels[test_idx],
+                optimal_threshold=optimal_th,
+                threshold_criterion=th_criterion,
             )
+        )
+
+    if th_enabled and compute_thresholds and folds_data and log is not None:
+        th_vals = [f.optimal_threshold for f in folds_data]
+        log.info(
+            f"🎯 [Pre-Learning Threshold ({th_criterion})] "
+            f"LOSO {len(folds_data)} Folds 最適閾値決定完了: "
+            f"Mean th* = {float(np.mean(th_vals)):.4f} ± {float(np.std(th_vals)):.4f} "
+            f"(range=[{float(np.min(th_vals)):.4f}, {float(np.max(th_vals)):.4f}])"
         )
 
     return folds_data, vis_feat_names, vital_feat_names, oof_gmm_soft, oof_sample_weight
@@ -257,6 +317,8 @@ def run_single_base_model_loso(
     loso_cfg = cfg.get("loso_cv", {}) if cfg else {}
     bm_cfg = dt_cfg.get("base_model", {})
     es_cfg = bm_cfg.get("early_stopping", {})
+    th_cfg = dt_cfg.get("threshold_decision", {})
+    th_criterion = normalize_criterion_name(th_cfg.get("default_criterion", "youden_j"))
 
     seed = int(loso_cfg.get("random_state", dt_cfg.get("random_state", 42)))
     save_plots = bool(dt_cfg.get("save_plots", True))
@@ -270,6 +332,7 @@ def run_single_base_model_loso(
     n_folds = len(folds_data)
 
     oof_preds = np.full(n_samples, np.nan, dtype=np.float32)
+    oof_thresholds = np.full(n_samples, 0.5, dtype=np.float32)
     fold_records: List[Dict] = []
     fold_models = []
     best_iterations: List[int] = []
@@ -281,7 +344,8 @@ def run_single_base_model_loso(
     log.info("-" * 75)
     log.info(
         f"▶ [Base Model: {modality.upper()} / {canonical_name.upper()}] "
-        f"LOSO-CV 開始 (Folds={n_folds}, Features={len(feature_names)}d, EarlyStopping={stop_rounds})"
+        f"LOSO-CV 開始 (Folds={n_folds}, Features={len(feature_names)}d, "
+        f"EarlyStopping={stop_rounds}, Threshold={th_criterion})"
     )
     start_time = time.time()
 
@@ -290,6 +354,7 @@ def run_single_base_model_loso(
         X_te = f_data.X_test_visual if modality == "visual" else f_data.X_test_vital
         y_tr_all = f_data.y_soft_train
         w_tr_all = f_data.sample_weights_train
+        th_k = float(getattr(f_data, "optimal_threshold", 0.5))
 
         if es_enabled and stop_rounds > 0 and f_data.inner_val_mask.any():
             tr_m = f_data.inner_tr_mask
@@ -320,6 +385,7 @@ def run_single_base_model_loso(
 
         y_pred_test = reg.predict(X_te).astype(np.float32)
         oof_preds[f_data.test_idx] = y_pred_test
+        oof_thresholds[f_data.test_idx] = th_k
 
         best_it = reg.best_iteration_ or 0
         best_iterations.append(int(best_it))
@@ -336,6 +402,7 @@ def run_single_base_model_loso(
             test_user=f_data.test_user,
             y_true=f_data.y_true_test,
             y_pred=y_pred_test,
+            threshold=th_k,
         )
         f_metrics["best_iteration"] = int(best_it)
         fold_records.append(f_metrics)
@@ -343,26 +410,30 @@ def run_single_base_model_loso(
         auc_str = f"{f_metrics['roc_auc']:.3f}" if pd.notna(f_metrics["roc_auc"]) else "N/A"
         pr_str = f"{f_metrics['pr_auc']:.3f}" if pd.notna(f_metrics["pr_auc"]) else "N/A"
         r_str = f"{f_metrics['pearson_r']:.3f}" if pd.notna(f_metrics["pearson_r"]) else "N/A"
+        bacc_str = f"{f_metrics['balanced_acc']:.3f}" if pd.notna(f_metrics["balanced_acc"]) else "N/A"
         log.info(
             f"  Fold [{f_data.fold:2d}/{n_folds:2d}] User: {f_data.test_user:<13} | "
-            f"BestIter: {best_it:3d} | MAE: {f_metrics['mae']:.4f} | r: {r_str} | "
-            f"AUC: {auc_str} | PR-AUC: {pr_str}"
+            f"th*: {th_k:.3f} | BestIter: {best_it:3d} | MAE: {f_metrics['mae']:.4f} | "
+            f"r: {r_str} | B-Acc: {bacc_str} | AUC: {auc_str} | PR-AUC: {pr_str}"
         )
 
     elapsed = time.time() - start_time
     avg_best_iter = float(np.mean(best_iterations)) if best_iterations else 0.0
 
-    # 全体 OOF 指標と Fold Mean ± Std の集計
+    # 全体 OOF 指標と Fold Mean ± Std の集計 (学習前決定の最適閾値 th*_k を適用)
     eval_res = compute_oof_and_fold_summary(
         y_true_all=labels,
         y_pred_all=oof_preds,
         fold_records=fold_records,
+        threshold=oof_thresholds,
     )
     fold_df = eval_res["fold_df"]
     stats_dict = eval_res["stats_dict"]
 
     log.info(
         f"✅ [{modality.upper()} / {canonical_name.upper()}] 完了 ({elapsed:.2f}s) | "
+        f"Mean th*={eval_res['optimal_threshold_mean']:.4f} | "
+        f"BalancedAcc={eval_res['balanced_acc']:.4f} | F1-Macro={eval_res['f1_macro']:.4f} | "
         f"ROC-AUC={eval_res['roc_auc']:.4f} | PR-AUC={eval_res['pr_auc']:.4f} | "
         f"Pearson r={eval_res['pearson_r']:.4f} | MAE={eval_res['mae']:.4f} | AvgBestIter={avg_best_iter:.1f}"
     )
@@ -371,12 +442,15 @@ def run_single_base_model_loso(
     fold_csv = modality_output_dir / f"loso_{tag}_folds.csv"
     fold_df.to_csv(fold_csv, index=False)
 
-    # 2. OOF 予測値 CSV 保存 (メタモデル学習でも直接再利用可能)
+    # 2. OOF 予測値 CSV 保存 (メタモデル学習でも最適閾値を含めて直接再利用可能)
     oof_df = meta_df.copy()
     oof_df["y_gmm_soft_oof"] = oof_gmm_soft
     oof_df["sample_weight_oof"] = oof_sample_weight
+    oof_df["optimal_threshold"] = oof_thresholds
+    oof_df["threshold_criterion"] = th_criterion
     oof_df[f"y_pred_{modality}_oof"] = oof_preds
     oof_df["y_pred_oof"] = oof_preds
+    oof_df["y_pred_binary"] = (oof_preds >= oof_thresholds).astype(int)
     oof_csv = modality_output_dir / f"loso_{tag}_oof_predictions.csv"
     oof_df.to_csv(oof_csv, index=False)
 
@@ -390,27 +464,38 @@ def run_single_base_model_loso(
     imp_csv = modality_output_dir / f"{canonical_name}_feature_importance.csv"
     imp_out_df.to_csv(imp_csv, index=False)
 
-    # 4. 学習済みモデルの保存 (全Foldモデル群 + 代表モデル + メタ情報)
+    # 4. 学習済みモデルの保存 (BaseModalityRegressor.save() 統一フォーマット + Fold別モデル群・最適閾値メタ情報)
     model_path = modality_output_dir / f"{canonical_name}_model.joblib"
-    if save_models:
-        model_bundle = {
+    if save_models and fold_models:
+        best_fold_idx = int(
+            np.argmax([
+                float(r["balanced_acc"]) if pd.notna(r.get("balanced_acc")) else -1.0
+                for r in fold_records
+            ])
+        )
+        representative_reg = fold_models[best_fold_idx]
+        extra_meta = {
             "model_name": canonical_name,
-            "modality": modality,
             "window_size": window_size,
-            "feature_names": feature_names,
-            "early_stopping_rounds": stop_rounds,
+            "representative_fold": int(folds_data[best_fold_idx].fold),
             "avg_best_iteration": avg_best_iter,
             "best_iterations_per_fold": best_iterations,
+            "threshold_criterion": th_criterion,
+            "mean_optimal_threshold": eval_res["optimal_threshold_mean"],
+            "std_optimal_threshold": eval_res["optimal_threshold_std"],
             "fold_models": [
                 {
                     "fold": f_data.fold,
                     "test_user": f_data.test_user,
+                    "optimal_threshold": float(f_data.optimal_threshold),
                     "best_iteration": m.best_iteration_,
                     "estimator": m.model,
                 }
                 for f_data, m in zip(folds_data, fold_models)
             ],
             "metrics": {
+                "optimal_threshold_mean": eval_res["optimal_threshold_mean"],
+                "optimal_threshold_std": eval_res["optimal_threshold_std"],
                 "roc_auc": eval_res["roc_auc"],
                 "pr_auc": eval_res["pr_auc"],
                 "pearson_r": eval_res["pearson_r"],
@@ -423,7 +508,7 @@ def run_single_base_model_loso(
                 "f1_macro": eval_res["f1_macro"],
             },
         }
-        joblib.dump(model_bundle, model_path)
+        representative_reg.save(model_path, extra_metadata=extra_meta)
         log.info(f"💾 学習済みベースモデルを保存しました: {model_path}")
 
     # 5. 可視化プロット保存
@@ -444,6 +529,7 @@ def run_single_base_model_loso(
             auc=eval_res["roc_auc"],
             pr_auc=eval_res["pr_auc"],
             log=log,
+            threshold=oof_thresholds,
         )
 
     # 6. 個別 Markdown レポート保存
@@ -465,6 +551,7 @@ def run_single_base_model_loso(
         stats_dict=stats_dict,
         fold_df=fold_df,
         log=log,
+        threshold_criterion=th_criterion,
     )
 
     eval_res.update({
@@ -472,6 +559,7 @@ def run_single_base_model_loso(
         "modality": modality,
         "avg_best_iteration": avg_best_iter,
         "oof_preds": oof_preds,
+        "oof_thresholds": oof_thresholds,
         "oof_csv": str(oof_csv),
         "model_path": str(model_path) if save_models else None,
         "plot_path": str(plot_path) if plot_path else None,

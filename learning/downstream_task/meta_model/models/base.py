@@ -64,11 +64,17 @@ class BaseMetaRegressor(ABC):
         if not path.exists():
             raise FileNotFoundError(f"メタモデルファイルが見つかりません: {path}")
         payload = joblib.load(path)
-        if isinstance(payload, dict) and "model" in payload:
-            self.name = payload.get("name", self.name)
+        if isinstance(payload, dict):
+            self.name = payload.get("name", payload.get("meta_model_name", self.name))
             self.params = payload.get("params", self.params)
             self.feature_names = payload.get("feature_names", self.feature_names)
-            self.model = payload["model"]
+            if "model" in payload and payload["model"] is not None:
+                self.model = payload["model"]
+            elif "final_estimator" in payload and payload["final_estimator"] is not None:
+                # 旧バンドル形式との後方互換フォールバック
+                self.model = payload["final_estimator"]
+            else:
+                raise ValueError(f"メタモデルファイルに有効な 'model' が含まれていません: {path}")
         else:
             self.model = payload
         return self

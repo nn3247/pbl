@@ -31,6 +31,8 @@ except ImportError:
 try:
     from ..data_loader import load_embeddings_and_meta, load_explicit_features
     from ..metrics import build_summary_row
+    from ..threshold_decision.criteria import normalize_criterion_name
+    from ..threshold_decision.pipeline import load_saved_fold_thresholds
     from .models import DEFAULT_BASE_MODELS, normalize_base_model_name
     from .reporter import (
         plot_dual_modality_comparison,
@@ -42,6 +44,8 @@ try:
 except (ImportError, ValueError):
     from downstream_task.data_loader import load_embeddings_and_meta, load_explicit_features
     from downstream_task.metrics import build_summary_row
+    from downstream_task.threshold_decision.criteria import normalize_criterion_name
+    from downstream_task.threshold_decision.pipeline import load_saved_fold_thresholds
     from downstream_task.base_model.models import DEFAULT_BASE_MODELS, normalize_base_model_name
     from downstream_task.base_model.reporter import (
         plot_dual_modality_comparison,
@@ -102,6 +106,7 @@ class BaseModelPipeline:
         weights: Optional[Union[Tuple[float, float], List[float]]] = None,
         covariance_type: Optional[str] = None,
         apply_subject_norm: Optional[bool] = None,
+        precomputed_folds: Optional[Dict] = None,
     ) -> pd.DataFrame:
         """
         指定されたモダリティ (visual, vital) とベースモデル群に対して
@@ -151,37 +156,61 @@ class BaseModelPipeline:
 
         start_t = time.time()
 
-        # 1. 埋め込み・メタデータ・明示的物理統計量の読み込み
-        emb_vis, emb_bio, meta_df = load_embeddings_and_meta(
-            data_dir=self.data_dir,
-            input_data_dir=self.input_data_dir,
-            learning_root=self.learning_root,
-            window_size=self.window_size,
-            log=log,
-        )
-        explicit_feats, explicit_names = load_explicit_features(
-            meta_df=meta_df,
-            input_data_dir=self.input_data_dir,
-            data_dir=self.data_dir,
-            window_size=self.window_size,
-            log=log,
-        )
+        if precomputed_folds is not None and precomputed_folds.get("loso_folds") is not None:
+            folds_data = precomputed_folds["loso_folds"]
+            vis_feat_names = precomputed_folds["vis_feat_names"]
+            vital_feat_names = precomputed_folds["vital_feat_names"]
+            oof_gmm_soft = precomputed_folds["oof_gmm_soft"]
+            oof_sample_weight = precomputed_folds["oof_sample_weight"]
+            meta_df = precomputed_folds["meta_df"]
+            log.info("✓ Step 7-0 (Threshold Decision) で準備済みの LOSO Fold データ & 最適閾値を引き継ぎました。")
+        else:
+            # 1. 埋め込み・メタデータ・明示的物理統計量の読み込み
+            emb_vis, emb_bio, meta_df = load_embeddings_and_meta(
+                data_dir=self.data_dir,
+                input_data_dir=self.input_data_dir,
+                learning_root=self.learning_root,
+                window_size=self.window_size,
+                log=log,
+            )
+            explicit_feats, explicit_names = load_explicit_features(
+                meta_df=meta_df,
+                input_data_dir=self.input_data_dir,
+                data_dir=self.data_dir,
+                window_size=self.window_size,
+                log=log,
+            )
 
-        # 2. 全 Fold の PLS・被験者標準化・GMM ソフトラベル・内部分割を一括準備
-        folds_data, vis_feat_names, vital_feat_names, oof_gmm_soft, oof_sample_weight = prepare_loso_folds(
-            emb_vis=emb_vis,
-            emb_bio=emb_bio,
-            meta_df=meta_df,
-            explicit_feats=explicit_feats,
-            explicit_names=explicit_names,
-            cfg=self.cfg,
-            log=log,
-            n_vis_pls=vis_pls,
-            n_bio_pls=bio_pls,
-            cov_type=cov_type,
-            weights=w_tuple,
-            apply_subject_norm=subj_norm,
-        )
+            # 2. 全 Fold の PLS・被験者標準化・GMM ソフトラベル・内部分割・Youden's J 最適閾値を一括準備
+            folds_data, vis_feat_names, vital_feat_names, oof_gmm_soft, oof_sample_weight = prepare_loso_folds(
+                emb_vis=emb_vis,
+                emb_bio=emb_bio,
+                meta_df=meta_df,
+                explicit_feats=explicit_feats,
+                explicit_names=explicit_names,
+                cfg=self.cfg,
+                log=log,
+                n_vis_pls=vis_pls,
+                n_bio_pls=bio_pls,
+                cov_type=cov_type,
+                weights=w_tuple,
+                apply_subject_norm=subj_norm,
+            )
+
+            # Step 7-0 が有効かつ同一基準の保存済み閾値ファイルがある場合のみ同期 (旧基準や無効設定時の上書きを防止)
+            th_cfg = self.downstream_cfg.get("threshold_decision", {})
+            if bool(th_cfg.get("enabled", True)):
+                expected_crit = normalize_criterion_name(th_cfg.get("default_criterion", "youden_j"))
+                fold_th_map, user_th_map = load_saved_fold_thresholds(
+                    self.output_dir.parent,
+                    criterion=expected_crit,
+                )
+                if fold_th_map or user_th_map:
+                    for f_data in folds_data:
+                        if f_data.fold in fold_th_map:
+                            f_data.optimal_threshold = float(fold_th_map[f_data.fold])
+                        elif str(f_data.test_user) in user_th_map:
+                            f_data.optimal_threshold = float(user_th_map[str(f_data.test_user)])
 
         modality_features = {
             "visual": vis_feat_names,

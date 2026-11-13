@@ -34,6 +34,13 @@ from .meta_model import (
     DEFAULT_META_MODELS,
     create_meta_model,
 )
+from .threshold_decision import (
+    ThresholdDecisionPipeline,
+    SUPPORTED_THRESHOLD_CRITERIA,
+    find_optimal_threshold,
+    normalize_criterion_name,
+    load_saved_fold_thresholds,
+)
 from .main import main
 
 __all__ = [
@@ -60,5 +67,10 @@ __all__ = [
     "BaseMetaRegressor",
     "DEFAULT_META_MODELS",
     "create_meta_model",
+    "ThresholdDecisionPipeline",
+    "SUPPORTED_THRESHOLD_CRITERIA",
+    "find_optimal_threshold",
+    "normalize_criterion_name",
+    "load_saved_fold_thresholds",
     "main",
 ]

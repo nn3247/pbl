@@ -91,6 +91,65 @@ def compute_physical_metrics_from_windows(
     return df_phys
 
 
+def _align_features_by_keys(
+    target_df: pd.DataFrame,
+    source_meta: pd.DataFrame,
+    source_features: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    被験者IDおよびウィンドウ識別キーを用いて、source_features を target_df の行順に安全に結合します。
+    行順依存のスライス (.iloc[:u_count]) を行わず、長さ不一致やキー不整合時は ValueError を送出します。
+    """
+    if len(source_meta) != len(source_features):
+        raise ValueError(
+            f"メタデータ行数 ({len(source_meta)}) と特徴量行数 ({len(source_features)}) が一致しません。"
+        )
+
+    user_col = next((c for c in ("username", "subject_id") if c in target_df.columns and c in source_meta.columns), None)
+    if user_col is None:
+        raise ValueError("キー結合に必要な被験者列 ('username' / 'subject_id') が見つかりません。")
+
+    window_key_candidates = [
+        "session_id", "video_id", "video_name",
+        "start_idx", "end_idx", "start_time", "end_time", "window_idx", "window_sec",
+    ]
+    shared_win_keys = [c for c in window_key_candidates if c in target_df.columns and c in source_meta.columns]
+    merge_keys = [user_col] + shared_win_keys
+
+    if not shared_win_keys:
+        # ウィンドウ識別キーがない場合は被験者ごとの件数一致を厳密検証
+        tgt_counts = target_df[user_col].astype(str).value_counts().to_dict()
+        src_counts = source_meta[user_col].astype(str).value_counts().to_dict()
+        for u, cnt in tgt_counts.items():
+            if src_counts.get(u, 0) < cnt:
+                raise ValueError(
+                    f"被験者 '{u}' のサンプル数が不足しています (target={cnt}, source={src_counts.get(u, 0)})。"
+                )
+
+    tgt_key_df = pd.DataFrame({k: target_df[k].astype(str) if k == user_col else target_df[k] for k in merge_keys})
+    src_key_df = pd.DataFrame({k: source_meta[k].astype(str) if k == user_col else source_meta[k] for k in merge_keys})
+
+    tgt_key_df["_dup_seq"] = tgt_key_df.groupby(merge_keys, sort=False).cumcount()
+    src_key_df["_dup_seq"] = src_key_df.groupby(merge_keys, sort=False).cumcount()
+
+    src_with_vals = pd.concat([src_key_df, source_features.reset_index(drop=True)], axis=1)
+    merged = pd.merge(
+        tgt_key_df,
+        src_with_vals,
+        on=merge_keys + ["_dup_seq"],
+        how="left",
+        sort=False,
+    )
+    if len(merged) != len(target_df):
+        raise ValueError(f"キー結合後の行数が一致しません (expected={len(target_df)}, actual={len(merged)})。")
+
+    feat_cols = list(source_features.columns)
+    if shared_win_keys and feat_cols and merged[feat_cols[0]].isna().all() and len(target_df) > 0:
+        raise ValueError(f"キー {merge_keys} による結合で一致する行が 0 件でした。")
+
+    return merged[feat_cols].reset_index(drop=True)
+
+
 def attach_physical_metrics_to_df(
     split_dfs: dict[str, pd.DataFrame],
     X_all: np.ndarray | None,
@@ -117,6 +176,11 @@ def attach_physical_metrics_to_df(
             meta_df=meta_raw,
         )
 
+        if meta_raw is not None and len(meta_raw) != len(df_phys_all):
+            raise ValueError(
+                f"meta_raw の行数 ({len(meta_raw)}) と X_all のサンプル数 ({len(df_phys_all)}) が一致しません。"
+            )
+
         for split_name, df_meta in split_dfs.items():
             phys_subset = pd.DataFrame()
             if (
@@ -126,26 +190,20 @@ def attach_physical_metrics_to_df(
             ):
                 idx_arr = split_indices[f"{split_name}_idx"]
                 phys_subset = df_phys_all.iloc[idx_arr].reset_index(drop=True)
+            elif meta_raw is not None and len(meta_raw) == len(df_phys_all):
+                if (
+                    len(df_meta) == len(df_phys_all)
+                    and "username" not in df_meta.columns
+                ):
+                    phys_subset = df_phys_all.copy().reset_index(drop=True)
+                else:
+                    phys_subset = _align_features_by_keys(
+                        target_df=df_meta,
+                        source_meta=meta_raw,
+                        source_features=df_phys_all,
+                    )
             elif len(df_meta) == len(df_phys_all):
                 phys_subset = df_phys_all.copy().reset_index(drop=True)
-            elif (
-                "username" in df_meta.columns
-                and meta_raw is not None
-                and "username" in meta_raw.columns
-                and len(meta_raw) == len(df_phys_all)
-            ):
-                # ユーザーID順およびサンプル数に合わせて被験者単位で正確にマッチング
-                df_phys_with_user = df_phys_all.copy()
-                df_phys_with_user["_u_str"] = meta_raw["username"].astype(str).values
-                matched_parts = []
-                for u in df_meta["username"].astype(str).unique():
-                    u_cnt = int((df_meta["username"].astype(str) == u).sum())
-                    u_rows = df_phys_with_user[df_phys_with_user["_u_str"] == u].iloc[:u_cnt]
-                    matched_parts.append(u_rows.drop(columns=["_u_str"]))
-                if matched_parts:
-                    cand_df = pd.concat(matched_parts, ignore_index=True)
-                    if len(cand_df) == len(df_meta):
-                        phys_subset = cand_df
 
             if len(phys_subset) == len(df_meta):
                 for col in phys_subset.columns:

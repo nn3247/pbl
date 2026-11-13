@@ -103,14 +103,21 @@ class BaseModalityRegressor(ABC):
         if not path.exists():
             raise FileNotFoundError(f"モデルファイルが見つかりません: {path}")
         payload = joblib.load(path)
-        if isinstance(payload, dict) and "model" in payload:
-            self.name = payload.get("name", self.name)
+        if isinstance(payload, dict):
+            self.name = payload.get("name", payload.get("model_name", self.name))
             self.modality = payload.get("modality", self.modality)
             self.params = payload.get("params", self.params)
             self.early_stopping_rounds = payload.get("early_stopping_rounds", self.early_stopping_rounds)
-            self.best_iteration_ = payload.get("best_iteration")
-            self.feature_names = payload.get("feature_names", [])
-            self.model = payload["model"]
+            self.best_iteration_ = payload.get("best_iteration", payload.get("avg_best_iteration"))
+            self.feature_names = payload.get("feature_names", self.feature_names)
+            if "model" in payload and payload["model"] is not None:
+                self.model = payload["model"]
+            elif "fold_models" in payload and payload["fold_models"]:
+                # 旧バンドル形式との後方互換フォールバック
+                first_fold = payload["fold_models"][0]
+                self.model = first_fold["estimator"] if isinstance(first_fold, dict) else first_fold
+            else:
+                raise ValueError(f"モデルファイルに有効な 'model' が含まれていません: {path}")
         else:
             self.model = payload
         return self

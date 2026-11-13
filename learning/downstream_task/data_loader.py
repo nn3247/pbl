@@ -32,19 +32,25 @@ VITAL_KEYWORDS = (
 def standardize_subject_wise(
     features: np.ndarray,
     usernames: Sequence,
-    eps: float = 1e-6,
+    eps: float = 1e-8,
 ) -> np.ndarray:
     """
     被験者 (username) ごとに平均0・分散1 (標準偏差1) となるよう Zスコア標準化を適用します。
+    NaN を含む場合は np.nanmean / np.nanstd を使用し、標準偏差が 0 または NaN の場合は 1.0 にフォールバックします。
     """
-    normed = np.zeros_like(features, dtype=np.float32)
+    feat_arr = np.asarray(features, dtype=np.float32)
+    normed = np.zeros_like(feat_arr, dtype=np.float32)
     user_arr = np.asarray(usernames).astype(str)
+    safe_eps = max(float(eps), 1e-8)
+
     for u in np.unique(user_arr):
         u_mask = user_arr == u
-        u_mean = np.mean(features[u_mask], axis=0, keepdims=True)
-        u_std = np.std(features[u_mask], axis=0, keepdims=True)
-        u_std = np.where(u_std < eps, 1.0, u_std)
-        normed[u_mask] = (features[u_mask] - u_mean) / u_std
+        sub_x = feat_arr[u_mask]
+        u_mean = np.nanmean(sub_x, axis=0, keepdims=True)
+        u_std = np.nanstd(sub_x, axis=0, keepdims=True)
+        u_mean = np.where(np.isnan(u_mean), 0.0, u_mean)
+        u_std = np.where(np.isnan(u_std) | (u_std < safe_eps), 1.0, u_std)
+        normed[u_mask] = (sub_x - u_mean) / u_std
     return normed
 
 
@@ -119,30 +125,36 @@ def load_embeddings_and_meta(
     learning_root: Path,
     window_size: str,
     log,
+    force_raw_embeddings: bool = True,
 ) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
-    """全被験者の PLS 潜在特徴量 (3d + 3d) または TS2Vec 32次元埋め込み (視覚 & 生体) およびメタデータを読み込み"""
-    # パターン 1: PLS 特徴量 CSV
-    pls_dir = learning_root / "data" / "pls"
-    cand_pls_list = [
-        pls_dir / f"pls_features_{window_size}_soft_labeled.csv",
-        pls_dir / f"pls_features_{window_size}_clustered.csv",
-        pls_dir / f"pls_features_{window_size}.csv",
-    ]
-    cand_pls = next((p for p in cand_pls_list if p.exists()), None)
-    if cand_pls is not None:
-        p_df = pd.read_csv(cand_pls)
-        vis_cols = [c for c in p_df.columns if c.startswith("vis_pls_")]
-        bio_cols = [c for c in p_df.columns if c.startswith("bio_pls_")]
-        if vis_cols and bio_cols:
-            log.info(f"✓ PLS 特徴量 CSV を検出・読み込みます: {cand_pls.name}")
-            log.info(
-                f"  ✓ 読み込み完了: サンプル数={len(p_df)}, 視覚PLS={len(vis_cols)}d, 生体PLS={len(bio_cols)}d, "
-                f"全被験者数={len(p_df['username'].unique()) if 'username' in p_df.columns else 'N/A'}"
-            )
-            return p_df[vis_cols].values.astype(np.float32), p_df[bio_cols].values.astype(np.float32), p_df
+    """
+    全被験者の TS2Vec 32次元埋め込み (視覚 & 生体) およびメタデータを読み込みます。
+    force_raw_embeddings=True (デフォルト) の場合、Fold 内 DualStream PLS のリークを防ぐため
+    事前計算済み PLS 特徴量 (pls_features_*.csv / pls_*.npy) をスキップし、必ず生埋め込み (emb_*.npy) を読み込みます。
+    """
+    if not force_raw_embeddings:
+        # パターン 1: PLS 特徴量 CSV (レガシー互換)
+        pls_dir = learning_root / "data" / "pls"
+        cand_pls_list = [
+            pls_dir / f"pls_features_{window_size}_soft_labeled.csv",
+            pls_dir / f"pls_features_{window_size}_clustered.csv",
+            pls_dir / f"pls_features_{window_size}.csv",
+        ]
+        cand_pls = next((p for p in cand_pls_list if p.exists()), None)
+        if cand_pls is not None:
+            p_df = pd.read_csv(cand_pls)
+            vis_cols = [c for c in p_df.columns if c.startswith("vis_pls_")]
+            bio_cols = [c for c in p_df.columns if c.startswith("bio_pls_")]
+            if vis_cols and bio_cols:
+                log.info(f"✓ PLS 特徴量 CSV を検出・読み込みます: {cand_pls.name}")
+                log.info(
+                    f"  ✓ 読み込み完了: サンプル数={len(p_df)}, 視覚PLS={len(vis_cols)}d, 生体PLS={len(bio_cols)}d, "
+                    f"全被験者数={len(p_df['username'].unique()) if 'username' in p_df.columns else 'N/A'}"
+                )
+                return p_df[vis_cols].values.astype(np.float32), p_df[bio_cols].values.astype(np.float32), p_df
 
-    # パターン 2: Split ごとの TS2Vec ファイルまたは PLS ファイルを探索 (最新の input_data_dir を優先)
-    search_dirs = [input_data_dir, data_dir]
+    # パターン 2: Split ごとの TS2Vec ファイルを探索 (data_dir または input_data_dir)
+    search_dirs = [data_dir, input_data_dir]
     src_dir = next(
         (d for d in search_dirs if (d / "meta_train.csv").exists() and (d / "emb_train_visual.npy").exists()),
         None
@@ -172,6 +184,10 @@ def load_embeddings_and_meta(
         meta_df = pd.concat(meta_dfs, ignore_index=True)
         emb_vis = np.concatenate(vis_arrs, axis=0).astype(np.float32)
         emb_bio = np.concatenate(bio_arrs, axis=0).astype(np.float32)
+        if len(emb_vis) != len(meta_df) or len(emb_bio) != len(meta_df):
+            raise ValueError(
+                f"埋め込みとメタデータの行数が一致しません: meta={len(meta_df)}, vis={len(emb_vis)}, bio={len(emb_bio)}"
+            )
 
         log.info(
             f"  ✓ 結合完了: サンプル数={len(meta_df)}, 視覚={emb_vis.shape}, 生体={emb_bio.shape}, "
@@ -179,39 +195,40 @@ def load_embeddings_and_meta(
         )
         return emb_vis, emb_bio, meta_df
 
-    # パターン 2b: Split 別 PLS ファイル (pls_train_visual.npy, pls_train_vital.npy, meta_train_soft_labeled.csv / meta_train.csv)
-    pls_src_dir = next(
-        (d for d in search_dirs if (d / "pls_train_visual.npy").exists() and (d / "pls_train_vital.npy").exists()),
-        None
-    )
-    if pls_src_dir is not None:
-        log.info("✓ Split 別 (Train/Val/Test) の PLS 潜在特徴量・メタデータを検出しました。全被験者データを結合します")
-        meta_dfs = []
-        vis_arrs = []
-        bio_arrs = []
-        for split_k in ["train", "val", "test"]:
-            v_p = pls_src_dir / f"pls_{split_k}_visual.npy"
-            b_p = pls_src_dir / f"pls_{split_k}_vital.npy"
-            m_cands = [
-                pls_src_dir / f"meta_{split_k}_soft_labeled.csv",
-                pls_src_dir / f"meta_{split_k}_clustered.csv",
-                pls_src_dir / f"meta_{split_k}.csv",
-            ]
-            m_p = next((p for p in m_cands if p.exists()), None)
-            if v_p.exists() and b_p.exists() and m_p is not None:
-                meta_dfs.append(pd.read_csv(m_p))
-                vis_arrs.append(np.load(v_p))
-                bio_arrs.append(np.load(b_p))
+    if not force_raw_embeddings:
+        # パターン 2b: Split 別 PLS ファイル (pls_train_visual.npy, pls_train_vital.npy, meta_train_soft_labeled.csv / meta_train.csv)
+        pls_src_dir = next(
+            (d for d in search_dirs if (d / "pls_train_visual.npy").exists() and (d / "pls_train_vital.npy").exists()),
+            None
+        )
+        if pls_src_dir is not None:
+            log.info("✓ Split 別 (Train/Val/Test) の PLS 潜在特徴量・メタデータを検出しました。全被験者データを結合します")
+            meta_dfs = []
+            vis_arrs = []
+            bio_arrs = []
+            for split_k in ["train", "val", "test"]:
+                v_p = pls_src_dir / f"pls_{split_k}_visual.npy"
+                b_p = pls_src_dir / f"pls_{split_k}_vital.npy"
+                m_cands = [
+                    pls_src_dir / f"meta_{split_k}_soft_labeled.csv",
+                    pls_src_dir / f"meta_{split_k}_clustered.csv",
+                    pls_src_dir / f"meta_{split_k}.csv",
+                ]
+                m_p = next((p for p in m_cands if p.exists()), None)
+                if v_p.exists() and b_p.exists() and m_p is not None:
+                    meta_dfs.append(pd.read_csv(m_p))
+                    vis_arrs.append(np.load(v_p))
+                    bio_arrs.append(np.load(b_p))
 
-        if meta_dfs:
-            meta_df = pd.concat(meta_dfs, ignore_index=True)
-            emb_vis = np.concatenate(vis_arrs, axis=0).astype(np.float32)
-            emb_bio = np.concatenate(bio_arrs, axis=0).astype(np.float32)
-            log.info(
-                f"  ✓ 結合完了: サンプル数={len(meta_df)}, 視覚={emb_vis.shape}, 生体={emb_bio.shape}, "
-                f"全被験者数={len(meta_df['username'].unique()) if 'username' in meta_df.columns else 'N/A'}"
-            )
-            return emb_vis, emb_bio, meta_df
+            if meta_dfs:
+                meta_df = pd.concat(meta_dfs, ignore_index=True)
+                emb_vis = np.concatenate(vis_arrs, axis=0).astype(np.float32)
+                emb_bio = np.concatenate(bio_arrs, axis=0).astype(np.float32)
+                log.info(
+                    f"  ✓ 結合完了: サンプル数={len(meta_df)}, 視覚={emb_vis.shape}, 生体={emb_bio.shape}, "
+                    f"全被験者数={len(meta_df['username'].unique()) if 'username' in meta_df.columns else 'N/A'}"
+                )
+                return emb_vis, emb_bio, meta_df
 
     # パターン 3: 一括 metadata.csv および一括埋め込みファイルの探索
     m_cands = [
@@ -277,7 +294,7 @@ def load_explicit_features(
         and not c.startswith("bio_pls_")
         and not c.startswith("cluster_prob_")
     ]
-    if len(stat_cols) >= 20:
+    if len(stat_cols) >= 15:
         log.info(f"✓ メタデータから直接 {len(stat_cols)} 次元の明示的物理特徴量を検出しました: {stat_cols[:4]} ...")
         return meta_df[stat_cols].values.astype(np.float32), stat_cols
 
@@ -289,21 +306,34 @@ def load_explicit_features(
             soft_meta_dfs.append(pd.read_csv(p))
     if soft_meta_dfs:
         combined_soft = pd.concat(soft_meta_dfs, ignore_index=True)
-        if len(combined_soft) == len(meta_df):
-            s_cols = [
-                c for c in combined_soft.columns
-                if c not in exclude_cols
-                and not c.startswith("vis_pls_")
-                and not c.startswith("bio_pls_")
-                and not c.startswith("cluster_prob_")
-            ]
-            if len(s_cols) >= 20:
+        s_cols = [
+            c for c in combined_soft.columns
+            if c not in exclude_cols
+            and not c.startswith("vis_pls_")
+            and not c.startswith("bio_pls_")
+            and not c.startswith("cluster_prob_")
+        ]
+        if len(s_cols) >= 15:
+            if len(combined_soft) == len(meta_df) and "username" not in meta_df.columns:
                 log.info(f"✓ meta_*_soft_labeled.csv から {len(s_cols)} 次元の明示的物理特徴量を検出しました")
                 return combined_soft[s_cols].values.astype(np.float32), s_cols
+            elif "username" in meta_df.columns and "username" in combined_soft.columns:
+                try:
+                    from clustering.analysis.metrics import _align_features_by_keys
+                    aligned_soft = _align_features_by_keys(
+                        target_df=meta_df,
+                        source_meta=combined_soft,
+                        source_features=combined_soft[s_cols],
+                    )
+                    log.info(f"✓ meta_*_soft_labeled.csv からキー結合により {len(s_cols)} 次元の明示的物理特徴量を検出しました")
+                    return aligned_soft.values.astype(np.float32), s_cols
+                except ValueError as ve:
+                    log.warning(f"⚠️ meta_*_soft_labeled.csv のキー結合をスキップします: {ve}")
 
-    # 2. X_windows.npy から動的算出 (被験者単位でのアライメント対応)
+    # 2. X_windows.npy から動的算出 (キーベースでの安全なアライメント対応)
     try:
         from features import compute_explicit_statistics
+        from clustering.analysis.metrics import _align_features_by_keys
         x_cands = [
             input_data_dir / "X_windows.npy",
             input_data_dir.parent / "combined" / window_size / "X_windows.npy",
@@ -321,32 +351,48 @@ def load_explicit_features(
         if x_path is not None:
             X_all = np.load(x_path)
             meta_raw = pd.read_csv(meta_raw_path) if meta_raw_path is not None else None
+            if meta_raw is not None and len(meta_raw) != len(X_all):
+                raise ValueError(
+                    f"metadata 行数 ({len(meta_raw)}) と X_windows サンプル数 ({len(X_all)}) が一致しません。"
+                )
+
+            # X_all のチャネル数 (7ch または 8ch) に応じて feature_cols を自動設定
+            c_kwargs = {}
+            if X_all.ndim == 3 and X_all.shape[2] == 7:
+                c_kwargs["feature_cols"] = [
+                    "ear_ratio",
+                    "head_pitch_diff",
+                    "head_yaw_diff",
+                    "head_roll_diff",
+                    "gaze_v_deg_diff",
+                    "gaze_h_deg_diff",
+                    "bpm_diff",
+                ]
             stat_matrix, stat_names = compute_explicit_statistics(
-                X_all, meta_df=meta_raw if meta_raw is not None and len(meta_raw) == len(X_all) else meta_df
+                X_all,
+                meta_df=meta_raw if meta_raw is not None else meta_df,
+                **c_kwargs,
             )
-            if len(stat_matrix) == len(meta_df):
+            stat_df = pd.DataFrame(stat_matrix, columns=stat_names)
+
+            if meta_raw is not None and "username" in meta_df.columns and "username" in meta_raw.columns:
+                aligned_df = _align_features_by_keys(
+                    target_df=meta_df,
+                    source_meta=meta_raw,
+                    source_features=stat_df,
+                )
+                log.info(
+                    f"✓ X_windows.npy からキー結合により {len(stat_names)} 次元の明示的物理特徴量を算出しました"
+                )
+                return aligned_df.values.astype(np.float32), stat_names
+            elif len(stat_matrix) == len(meta_df):
                 log.info(f"✓ X_windows.npy から {len(stat_names)} 次元の明示的物理特徴量を算出しました")
                 return stat_matrix.astype(np.float32), stat_names
-            elif (
-                meta_raw is not None
-                and len(meta_raw) == len(stat_matrix)
-                and "username" in meta_raw.columns
-                and "username" in meta_df.columns
-            ):
-                stat_df = pd.DataFrame(stat_matrix, columns=stat_names)
-                stat_df["_u_str"] = meta_raw["username"].astype(str).values
-                matched_list = []
-                for u in meta_df["username"].astype(str).unique():
-                    u_count = int((meta_df["username"].astype(str) == u).sum())
-                    u_stat = stat_df[stat_df["_u_str"] == u].iloc[:u_count]
-                    matched_list.append(u_stat[stat_names])
-                if matched_list:
-                    matched_df = pd.concat(matched_list, ignore_index=True)
-                    if len(matched_df) == len(meta_df):
-                        log.info(
-                            f"✓ X_windows.npy から被験者マッチングにより {len(stat_names)} 次元の明示的物理特徴量を算出しました"
-                        )
-                        return matched_df.values.astype(np.float32), stat_names
+            else:
+                raise ValueError(
+                    f"X_windows サンプル数 ({len(stat_matrix)}) と meta_df 行数 ({len(meta_df)}) が一致せず、"
+                    "キー結合用の metadata.csv も利用できません。"
+                )
     except Exception as e:
         log.warning(f"明示的特徴量の取得をスキップします: {e}")
 

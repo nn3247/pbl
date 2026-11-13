@@ -57,11 +57,14 @@ def main():
             "hybrid_feature",        # 物理統計量集約 & TS2Vec 特徴量結合 (Feature Fusion)
             "fusion",                # hybrid_feature のエイリアス
             "hybrid",                # hybrid_feature のエイリアス
+            "threshold_decision",    # 学習前 閾値決定 (Balanced Accuracy 最大化 / Youden's J Index)
+            "threshold",             # threshold_decision のエイリアス
+            "th",                    # threshold_decision のエイリアス
             "base_model",            # Visual / Vital 各モダリティのベースモデル作成・評価
             "base",                  # base_model のエイリアス
             "meta_model",            # 選択ベースモデルを用いたメタモデル作成・最終推論
             "meta",                  # meta_model のエイリアス
-            "downstream_task",       # 下流タスク一括 (base_model + meta_model)
+            "downstream_task",       # 下流タスク一括 (threshold_decision ➔ base_model ➔ meta_model)
             "downstream",            # downstream_task のエイリアス
             "tree_models",           # downstream_task のエイリアス
             "loso_cv",               # LOSO-CV 完全データリークフリー回帰学習
@@ -69,7 +72,7 @@ def main():
             "loso",                  # loso_cv のエイリアス
         ],
         default=["all"],
-        help="実行するパイプラインの工程を指定 (例: --stage all / --stage base_model / --stage meta_model)"
+        help="実行するパイプラインの工程を指定 (例: --stage all / --stage threshold_decision / --stage base_model / --stage meta_model)"
     )
 
     parser.add_argument(
@@ -114,7 +117,9 @@ def main():
     )
 
     parser.add_argument(
+        "--base-models",
         "--models",
+        dest="base_models",
         nargs="+",
         default=None,
         choices=[
@@ -123,12 +128,21 @@ def main():
             "lightgbm", "lgbm", "lgb",
             "catboost", "cb",
             "adaboost", "ada",
+        ],
+        help="学習対象のベースモデル (未指定時は config.yaml の設定を参照)"
+    )
+
+    parser.add_argument(
+        "--meta-models",
+        nargs="+",
+        default=None,
+        choices=[
             "logistic_regression", "lr",
             "ridge",
             "lasso",
             "elastic_net", "elasticnet", "en",
         ],
-        help="学習対象のベースモデルまたはメタモデル (未指定時は config.yaml の設定を参照)"
+        help="学習対象のメタモデル (未指定時は config.yaml の設定を参照)"
     )
 
     parser.add_argument(
@@ -143,6 +157,13 @@ def main():
         type=str,
         default=None,
         help="Meta Model 学習時に採用する Vital ベースモデル指定"
+    )
+
+    parser.add_argument(
+        "--criteria",
+        nargs="+",
+        default=None,
+        help="学習前の閾値決定基準 (デフォルト: youden_j [Balanced Accuracy最大化])"
     )
 
     parser.add_argument(
@@ -223,12 +244,14 @@ def main():
                 log.warning("⚠️ クラスタリングが完了しなかったため、以降の工程をスキップします。")
                 continue
 
-            # Step 7: 下流タスク (Base Model [Visual/Vital] ➔ Meta Model)
-            downstream_pipe.run_all(
+            # Step 7: 下流タスク (Step 7-0: Threshold Decision [Youden's J] ➔ Step 7-1: Base Model ➔ Step 7-2: Meta Model)
+            downstream_pipe.run_downstream_task(
                 stage="all",
-                base_models=args.models,
+                base_models=args.base_models,
+                meta_models=args.meta_models,
                 visual_model=args.visual_model,
                 vital_model=args.vital_model,
+                threshold_criteria=args.criteria,
                 weights=args.weights,
                 covariance_type=args.covariance_type,
             )
@@ -255,28 +278,45 @@ def main():
             if "hybrid_feature" in stages or "fusion" in stages or "hybrid" in stages:
                 log.info("ℹ️ hybrid_feature は Step 7 (downstream_task) の内部処理に統合されました。")
 
-            if any(s in stages for s in [
+            has_downstream_all = any(s in stages for s in [
                 "downstream_task", "downstream", "tree_models",
                 "loso_cv", "loso_regression", "loso"
-            ]):
+            ])
+            has_th = any(s in stages for s in ["threshold_decision", "threshold", "th"])
+            has_base = any(s in stages for s in ["base_model", "base"])
+            has_meta = any(s in stages for s in ["meta_model", "meta"])
+
+            if has_downstream_all or (has_base and has_meta):
                 downstream_pipe.run_downstream_task(
                     stage="all",
-                    base_models=args.models,
+                    base_models=args.base_models,
+                    meta_models=args.meta_models,
                     visual_model=args.visual_model,
                     vital_model=args.vital_model,
+                    threshold_criteria=args.criteria,
                     weights=args.weights,
                     covariance_type=args.covariance_type,
                 )
             else:
-                if "base_model" in stages or "base" in stages:
-                    downstream_pipe.run_base_models(
-                        models=args.models,
+                if has_th and not has_base:
+                    downstream_pipe.run_downstream_task(
+                        stage="threshold_decision",
+                        threshold_criteria=args.criteria,
                         weights=args.weights,
                         covariance_type=args.covariance_type,
                     )
-                if "meta_model" in stages or "meta" in stages:
-                    downstream_pipe.run_meta_models(
-                        models=args.models,
+                if has_base:
+                    downstream_pipe.run_downstream_task(
+                        stage="base_model",
+                        base_models=args.base_models,
+                        threshold_criteria=args.criteria,
+                        weights=args.weights,
+                        covariance_type=args.covariance_type,
+                    )
+                if has_meta:
+                    downstream_pipe.run_downstream_task(
+                        stage="meta_model",
+                        meta_models=args.meta_models,
                         visual_model=args.visual_model,
                         vital_model=args.vital_model,
                     )

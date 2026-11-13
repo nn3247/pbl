@@ -56,10 +56,6 @@ def compute_explicit_statistics(
         gaze_cols = DEFAULT_GAZE_COLS
 
     n_samples, time_steps, n_channels = X.shape
-    if n_channels == 7 and "bvp_selected" in feature_cols:
-        # vital が HR のみ (bvp_selected 除外) の 7 チャネル時系列に対応
-        feature_cols = [c for c in feature_cols if c != "bvp_selected"]
-
     col_to_idx = {col: i for i, col in enumerate(feature_cols)}
 
     features_dict: dict[str, np.ndarray] = {}
@@ -84,9 +80,25 @@ def compute_explicit_statistics(
         # メタデータ等にベースラインがない場合のフォールバック
         bpm_baseline_arr = np.zeros(n_samples, dtype=np.float32)
     elif baseline_mode == "relative_to_first" and len(bpm_baseline_arr) > 0:
-        # 先頭基準窓との差分（タスク中の心拍ドリフト・疲労応答）
-        first_val = bpm_baseline_arr[0]
-        bpm_baseline_arr = bpm_baseline_arr - first_val
+        # 被験者ごとの先頭基準窓との差分（タスク中の心拍ドリフト・疲労応答）
+        user_col = None
+        if meta_df is not None and len(meta_df) == n_samples:
+            user_col = next((c for c in ("username", "subject_id") if c in meta_df.columns), None)
+
+        if user_col is not None:
+            user_arr = meta_df[user_col].astype(str).values
+            shifted = bpm_baseline_arr.copy()
+            for u in np.unique(user_arr):
+                u_mask = user_arr == u
+                u_vals = bpm_baseline_arr[u_mask]
+                valid_vals = u_vals[~np.isnan(u_vals)]
+                first_val = float(valid_vals[0]) if len(valid_vals) > 0 else 0.0
+                shifted[u_mask] = u_vals - first_val
+            bpm_baseline_arr = shifted
+        else:
+            valid_vals = bpm_baseline_arr[~np.isnan(bpm_baseline_arr)]
+            first_val = float(valid_vals[0]) if len(valid_vals) > 0 else 0.0
+            bpm_baseline_arr = bpm_baseline_arr - first_val
 
     # 1. 各特徴量チャネルの平均値 (Mean) [8次元]
     for col in feature_cols:
