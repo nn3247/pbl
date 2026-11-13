@@ -13,12 +13,15 @@ from .constants import (
     DEFAULT_TOTAL_LATENT_DIMS,
 )
 from .explicit_stats import compute_explicit_statistics
+from .hrv_features import HRV_FEATURE_NAMES, compute_causal_hrv_features
 
 # 後方互換性用エイリアス
 explicit_statistics = explicit_stats
 
 __all__ = [
     "compute_explicit_statistics",
+    "compute_causal_hrv_features",
+    "HRV_FEATURE_NAMES",
     "DEFAULT_FEATURE_COLS",
     "DEFAULT_HEAD_POSE_COLS",
     "DEFAULT_GAZE_COLS",
