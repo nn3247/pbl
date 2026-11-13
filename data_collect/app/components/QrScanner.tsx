@@ -1,7 +1,7 @@
 "use client";
 
 import React, { useEffect, useRef, useState } from "react";
-import { Html5Qrcode, Html5QrcodeScannerState } from "html5-qrcode";
+import { Html5Qrcode } from "html5-qrcode";
 
 interface QrScannerProps {
   onScanSuccess: (decodedText: string) => void;
@@ -15,45 +15,79 @@ export default function QrScanner({ onScanSuccess, onError }: QrScannerProps) {
 
   useEffect(() => {
     let isCancelled = false;
+    let isStopping = false;
     let localScanner: Html5Qrcode | null = null;
+    let startPromise: Promise<null> | null = null;
 
+    // 安全にカメラとスキャナを停止・解放する関数
     const stopAndReleaseCamera = async (scanner: Html5Qrcode | null) => {
-      if (!scanner) return;
-      try {
-        const state = scanner.getState();
-        if (
-          state === Html5QrcodeScannerState.SCANNING ||
-          state === Html5QrcodeScannerState.PAUSED
-        ) {
-          await scanner.stop();
-        }
-      } catch (e) {
-        console.warn("Scanner stop warning:", e);
-      }
+      if (!scanner || isStopping) return;
+      isStopping = true;
 
       try {
-        scanner.clear();
-      } catch (e) {
-        console.warn("Scanner clear warning:", e);
-      }
-
-      // 明示的にコンテナ内の全MediaStreamTrackを停止してカメラリソースを完全解放
-      const container = document.getElementById("qr-reader");
-      if (container) {
-        const videoElements = container.getElementsByTagName("video");
-        for (let i = 0; i < videoElements.length; i++) {
-          const v = videoElements[i];
-          if (v.srcObject && "getTracks" in (v.srcObject as MediaStream)) {
-            (v.srcObject as MediaStream).getTracks().forEach((track) => track.stop());
-            v.srcObject = null;
+        // 起動処理中であれば、起動が完了または失敗するまで待機してから停止する
+        if (startPromise) {
+          try {
+            await startPromise;
+          } catch {
+            // 起動時のエラーは無視
           }
         }
+
+        // スキャンが進行中であれば停止
+        if (scanner.isScanning) {
+          try {
+            await scanner.stop();
+          } catch (e: unknown) {
+            // removeChildエラーや既に停止している場合のエラーを安全にハンドリング
+            const msg = e instanceof Error ? e.message : String(e);
+            if (!msg.includes("removeChild") && !msg.includes("not running")) {
+              console.warn("Scanner stop warning:", e);
+            }
+          }
+        }
+
+        // カメラのMediaStreamトラックを明示的に停止
+        const container = document.getElementById("qr-reader");
+        if (container) {
+          const videoElements = container.getElementsByTagName("video");
+          for (let i = 0; i < videoElements.length; i++) {
+            const v = videoElements[i];
+            if (v.srcObject && "getTracks" in (v.srcObject as MediaStream)) {
+              (v.srcObject as MediaStream).getTracks().forEach((track) => {
+                try {
+                  track.stop();
+                } catch {
+                  // 無視
+                }
+              });
+              v.srcObject = null;
+            }
+          }
+
+          // DOM内にコンテナが存在し、かつスキャン停止している場合のみクリア
+          if (document.body.contains(container) && !scanner.isScanning) {
+            try {
+              scanner.clear();
+            } catch {
+              // clearのエラーは安全に握りつぶす
+            }
+          }
+        }
+      } catch (e) {
+        console.warn("Camera release warning:", e);
+      } finally {
+        isStopping = false;
       }
     };
 
     const startScanner = async () => {
       setIsStarting(true);
       setCameraError(null);
+
+      // DOMコンテナが存在するか確認
+      const container = document.getElementById("qr-reader");
+      if (!container || isCancelled) return;
 
       try {
         const scanner = new Html5Qrcode("qr-reader");
@@ -69,50 +103,49 @@ export default function QrScanner({ onScanSuccess, onError }: QrScannerProps) {
           if (isCancelled) return;
           isCancelled = true; // 重複スキャン防止
 
-          // 次の画面（同意画面や計測画面）でカメラ重複（Device in use）が発生しないよう
-          // 確実にストリームを停止・解放してからコールバックを呼ぶ
           await stopAndReleaseCamera(localScanner);
           onScanSuccess(decodedText);
         };
 
         const handleError = () => {
-          // 各フレームごとの未検出エラーは無視
+          // 各フレームごとのQRコード未検出は正常動作のため無視
         };
 
-        try {
-          // まず環境カメラ（背面カメラ）を試す
-          await scanner.start(
-            { facingMode: "environment" },
-            config,
-            handleSuccess,
-            handleError
-          );
-        } catch {
-          if (isCancelled) {
-            await stopAndReleaseCamera(scanner);
-            return;
-          }
-          // 背面カメラがない（PC等）の場合はフロントカメラ/デフォルトカメラで試す
-          await scanner.start(
-            { facingMode: "user" },
-            config,
-            handleSuccess,
-            handleError
-          );
+        // デバイス一覧を取得して最適なカメラを選択
+        const cameras = await Html5Qrcode.getCameras().catch(() => []);
+        if (isCancelled) {
+          await stopAndReleaseCamera(scanner);
+          return;
         }
+
+        let cameraConfig: string | { facingMode: string } = { facingMode: "user" };
+
+        if (cameras && cameras.length > 0) {
+          // 背面カメラ（back / rear / environment）があれば優先
+          const backCamera = cameras.find((c) =>
+            /back|rear|environment/i.test(c.label)
+          );
+          cameraConfig = backCamera ? backCamera.id : cameras[0].id;
+        }
+
+        // カメラ起動のPromiseを保持
+        const p = scanner.start(cameraConfig, config, handleSuccess, handleError);
+        startPromise = p;
+        await p;
 
         if (isCancelled) {
           await stopAndReleaseCamera(scanner);
         } else {
           setIsStarting(false);
         }
-      } catch {
+      } catch (err: unknown) {
         if (!isCancelled) {
           setIsStarting(false);
           const msg =
             "カメラの起動に失敗しました。カメラの利用権限を許可するか、下のボタンからパスワード入力を行ってください。";
           setCameraError(msg);
           onError?.(msg);
+          console.warn("Scanner start error:", err);
         }
       }
     };

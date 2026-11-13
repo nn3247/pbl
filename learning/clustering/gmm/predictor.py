@@ -99,25 +99,14 @@ def apply_and_save_clusters(
             c1_ratio = float(np.mean(y_train_task[c1_mask])) if np.any(c1_mask) else 0.0
             c0_ratio = float(np.mean(y_train_task[c0_mask])) if np.any(c0_mask) else 0.0
 
-            y_soft_train = split_infer["train"]["y_soft"]
-            y_soft_val = split_infer["val"]["y_soft"] if "val" in split_infer else None
-            y_soft_test = split_infer["test"]["y_soft"] if "test" in split_infer else None
-
             # クラスタ0の方が集中タスク割合が高い場合、クラスタ定義が逆転している
             inverted = bool(c0_ratio > c1_ratio)
-            if c0_ratio > c1_ratio:
-                # クラスタ1が「集中」になるよう、全スプリットのソフトラベルを反転
-                y_soft_train = 1.0 - y_soft_train
-                if y_soft_val is not None:
-                    y_soft_val = 1.0 - y_soft_val
-                if y_soft_test is not None:
-                    y_soft_test = 1.0 - y_soft_test
-
-            split_infer["train"]["y_soft"] = y_soft_train
-            if y_soft_val is not None:
-                split_infer["val"]["y_soft"] = y_soft_val
-            if y_soft_test is not None:
-                split_infer["test"]["y_soft"] = y_soft_test
+            if inverted:
+                # クラスタ1が「集中」になるよう、全スプリットのラベル・確率列自体を入れ替えた上でソフトラベルを再計算
+                for s_info in split_infer.values():
+                    s_info["labels"] = 1 - np.asarray(s_info["labels"], dtype=int)
+                    s_info["probs"] = np.asarray(s_info["probs"], dtype=np.float64)[:, [1, 0]]
+                    s_info["y_soft"] = compute_soft_labels(s_info["probs"], w_init)
 
             log.info(
                 f"GMM Alignment: c1_ratio={c1_ratio:.3f}, c0_ratio={c0_ratio:.3f} -> (Inverted: {inverted})"
@@ -168,7 +157,7 @@ def apply_and_save_clusters(
 
     # 全スプリット結合版の PLS クラスタリング結果も安全に保存
     pls_dir = _LEARNING_DIR / "data" / "pls"
-    if pls_dir.exists() and len(clustered_dfs) > 0:
+    if data_dir is not None and pls_dir.exists() and len(clustered_dfs) > 0:
         all_dfs = []
         for s_name, d_meta in clustered_dfs.items():
             c_df = d_meta.copy()

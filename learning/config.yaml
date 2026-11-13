@@ -142,6 +142,25 @@ downstream_task:
   save_models: true
 
   # ----------------------------------------------------------------------------
+  # Step 7-0: 学習前 閾値決定 (Pre-Learning Threshold Decision) 設定
+  # ----------------------------------------------------------------------------
+  threshold_decision:
+    enabled: true
+    # 最適閾値決定基準: Balanced Accuracy 最大化 (Youden's J Index: J(th) = Recall + Specificity - 1)
+    default_criterion: "youden_j"
+    criteria:
+      - "youden_j"
+      - "f1_macro"
+      - "pr_balance"
+    search_range: [0.05, 0.95]
+    search_step: 0.005
+    use_exact_curve_points: true
+    fallback_threshold: 0.5
+    validation_split_mode: "train_oof"   # "train_oof": 各Foldの非テスト被験者全体で探索 / "group_val": Fold内検証分割のみ
+    val_subject_ratio: 0.2
+    save_plots: true
+
+  # ----------------------------------------------------------------------------
   # Step 7-1: Base Model 設定 (Visual / Vital 各モダリティで個別に学習・評価・保存)
   # ----------------------------------------------------------------------------
   base_model:

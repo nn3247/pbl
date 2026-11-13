@@ -88,6 +88,7 @@ def generate_visualizations(
     auc: float,
     pr_auc: float,
     log,
+    threshold: float | np.ndarray = 0.5,
 ) -> Path:
     """可視化グラフ (散布図, 被験者別性能棒グラフ, 混同行列) の保存"""
     fig, axes = plt.subplots(1, 3, figsize=(19, 5.2), dpi=130)
@@ -120,11 +121,19 @@ def generate_visualizations(
     ax2.grid(True, linestyle="--", alpha=0.5, axis="y")
     ax2.legend()
 
-    # 3. 混同行列 (二値化 0.5)
+    # 3. 混同行列 (学習前決定の最適閾値 th* または 0.5)
     ax3 = axes[2]
-    y_true_b = (y_true >= 0.5).astype(int)
-    y_pred_b = (y_pred >= 0.5).astype(int)
-    cm = confusion_matrix(y_true_b, y_pred_b)
+    y_true_b = (np.asarray(y_true, dtype=float) >= 0.5).astype(int)
+    if np.ndim(threshold) == 0:
+        th_val = float(threshold)
+        y_pred_b = (np.asarray(y_pred, dtype=float) >= th_val).astype(int)
+        th_label = f"Th*={th_val:.3f}"
+    else:
+        th_arr = np.asarray(threshold, dtype=float).ravel()
+        y_pred_b = (np.asarray(y_pred, dtype=float).ravel() >= th_arr).astype(int)
+        th_label = f"Mean Th*={float(np.mean(th_arr)):.3f}"
+
+    cm = confusion_matrix(y_true_b, y_pred_b, labels=[0, 1])
     im = ax3.imshow(cm, cmap="Blues", interpolation="nearest")
     for i in range(2):
         for j in range(2):
@@ -145,7 +154,7 @@ def generate_visualizations(
     pr_str = f"{pr_auc:.3f}" if not np.isnan(pr_auc) else "N/A"
     bacc_str = f"{balanced_acc:.1%}" if not np.isnan(balanced_acc) else "N/A"
     ax3.set_title(
-        f"Confusion Matrix (Th=0.5)\nAcc={acc:.1%}, B-Acc={bacc_str} | AUC={auc_str}, PR-AUC={pr_str}",
+        f"Confusion Matrix ({th_label})\nAcc={acc:.1%}, B-Acc={bacc_str} | AUC={auc_str}, PR-AUC={pr_str}",
         fontsize=11.5,
         fontweight="bold",
     )
@@ -176,6 +185,7 @@ def save_markdown_report(
     stats_dict: dict[str, tuple[float, float]],
     fold_df: pd.DataFrame,
     log,
+    threshold_criterion: str = "youden_j",
 ) -> Path:
     """Markdown 評価レポートの出力 (総合 OOF スコア & Fold 間 Mean ± Std 併記版)"""
     report_path = output_dir / f"loso_{model_name}_report.md"
@@ -188,6 +198,11 @@ def save_markdown_report(
             return f"{mean_v:.4f} ± {std_v:.4f} ({mean_v:.1%})"
         return f"{mean_v:.4f} ± {std_v:.4f}"
 
+    th_mean, th_std = stats_dict.get("optimal_threshold", (0.5, 0.0))
+    if np.isnan(th_mean):
+        th_mean, th_std = 0.5, 0.0
+    th_desc = f"学習前決定 最適閾値 $th^*_k$ (`{threshold_criterion}`, Mean={th_mean:.4f}±{th_std:.4f})"
+
     lines = [
         f"# 🛡️ LOSO-CV 回帰モデル評価レポート [{model_name.upper()} | Window: {window_size}]",
         "",
@@ -195,7 +210,8 @@ def save_markdown_report(
         "- **評価手法**: Leave-One-Subject-Out Cross-Validation (LOSO-CV) - 完全データリークフリー",
         f"- **対象被験者数**: {n_users} 名 (計 {len(fold_df)} Folds)",
         f"- **回帰モデル**: `{model_name}` (Regressor, 目的変数: GMMソフト確率ラベル ∈ [0, 1])",
-        "- **Fold内処理**: Train被験者のみで PLS fit ➔ 被験者別 Zスコア標準化 ➔ Train被験者のみで GMM (k=2) fit ➔ Train被験者のみで Late Fusion 学習 ➔ Test被験者推論",
+        f"- **二値判定カットオフ閾値**: {th_desc}",
+        "- **Fold内処理**: Train被験者のみで PLS fit ➔ 被験者別 Zスコア標準化 ➔ Train被験者のみで GMM (k=2) fit ➔ **Train被験者のみで Youden's J 最適閾値 $th^*_k$ 決定** ➔ モデル学習 ➔ Test被験者推論",
         "",
         "## 2. 全体 Out-Of-Fold (OOF) 総合性能 & Fold間ばらつき (Mean ± Std)",
         "| 指標区分 | 評価指標 | 総合 OOF スコア | Fold 間平均 ± 標準偏差 (Mean ± Std) | 理想値・備考 |",
@@ -205,18 +221,20 @@ def save_markdown_report(
         f"| | **R² Score (決定係数)** | **{r2:.4f}** | {fmt_ms('r2')} | 1.0 (正値ほど説明力高) |",
         f"| | **Pearson 相関係数 (r)** | **{r_val:.4f}** | {fmt_ms('pearson_r')} | 1.0 (線形相関) |",
         f"| | **Spearman 順位相関係数 (ρ)** | **{rho_val:.4f}** | {fmt_ms('spearman_rho')} | 1.0 (単調順位相関) |",
-        f"| **二値判定性能 (閾値 0.5)** | **ROC-AUC** | **{auc:.4f}** | {fmt_ms('roc_auc')} | 1.0 (総合判別能) |",
+        f"| **二値判定性能 (最適閾値 $th^*_k$)** | **採用閾値 $th^*_k$ (`{threshold_criterion}`)** | **{th_mean:.4f}** | {fmt_ms('optimal_threshold')} | Youden's J (Balanced Acc 最大化) |",
+        f"| | **ROC-AUC** | **{auc:.4f}** | {fmt_ms('roc_auc')} | 1.0 (総合判別能) |",
         f"| | **PR-AUC (Average Precision)** | **{pr_auc:.4f}** | {fmt_ms('pr_auc')} | 1.0 (不均衡データ少数派検出能) |",
         f"| | **Accuracy (正解率)** | **{acc:.4f} ({acc:.1%})** | {fmt_ms('accuracy', is_pct=True)} | 100.0% |",
         f"| | **Balanced Accuracy (均衡正解率)** | **{balanced_acc:.4f} ({balanced_acc:.1%})** | {fmt_ms('balanced_acc', is_pct=True)} | 100.0% (不均衡補正版) |",
         f"| | **F1-Macro** | **{f1_macro:.4f}** | {fmt_ms('f1_macro')} | 1.0 |",
         "",
         "## 3. 被験者別 (Fold別) 性能詳細一覧",
-        "| Fold | Test 被験者 ID | N | MAE | RMSE | R² | Pearson r | Spearman ρ | Acc | Balanced Acc | ROC-AUC | PR-AUC | F1-Macro |",
-        "|---|---|---|---|---|---|---|---|---|---|---|---|---|",
+        "| Fold | Test 被験者 ID | N | $th^*_k$ | MAE | RMSE | R² | Pearson r | Spearman ρ | Acc | Balanced Acc | ROC-AUC | PR-AUC | F1-Macro |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
 
     for _, r in fold_df.iterrows():
+        th_s = f"{r['optimal_threshold']:.4f}" if pd.notna(r.get('optimal_threshold')) else f"{th_mean:.4f}"
         r2_s = f"{r['r2']:.4f}" if pd.notna(r.get('r2')) else "N/A"
         r_s = f"{r['pearson_r']:.3f}" if pd.notna(r.get('pearson_r')) else "N/A"
         rho_s = f"{r['spearman_rho']:.3f}" if pd.notna(r.get('spearman_rho')) else "N/A"
@@ -227,22 +245,22 @@ def save_markdown_report(
         f1_s = f"{r['f1_macro']:.3f}" if pd.notna(r.get('f1_macro')) else "N/A"
 
         lines.append(
-            f"| {int(r['fold']):2d} | `{r['test_user']}` | {int(r['n_test']):,d} | "
+            f"| {int(r['fold']):2d} | `{r['test_user']}` | {int(r['n_test']):,d} | {th_s} | "
             f"{r['mae']:.4f} | {r['rmse']:.4f} | {r2_s} | {r_s} | {rho_s} | "
             f"{acc_s} | {bacc_s} | {auc_s} | {pr_s} | {f1_s} |"
         )
 
     # 平均・標準偏差のサマリー行
-    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    lines.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     lines.append(
-        f"| **Mean** | - | - | "
+        f"| **Mean** | - | - | **{th_mean:.4f}** | "
         f"**{stats_dict['mae'][0]:.4f}** | **{stats_dict['rmse'][0]:.4f}** | **{stats_dict['r2'][0]:.4f}** | "
         f"**{stats_dict['pearson_r'][0]:.3f}** | **{stats_dict['spearman_rho'][0]:.3f}** | "
         f"**{stats_dict['accuracy'][0]:.1%}** | **{stats_dict['balanced_acc'][0]:.1%}** | "
         f"**{stats_dict['roc_auc'][0]:.3f}** | **{stats_dict['pr_auc'][0]:.3f}** | **{stats_dict['f1_macro'][0]:.3f}** |"
     )
     lines.append(
-        f"| **Std** | - | - | "
+        f"| **Std** | - | - | ±{th_std:.4f} | "
         f"±{stats_dict['mae'][1]:.4f} | ±{stats_dict['rmse'][1]:.4f} | ±{stats_dict['r2'][1]:.4f} | "
         f"±{stats_dict['pearson_r'][1]:.3f} | ±{stats_dict['spearman_rho'][1]:.3f} | "
         f"±{stats_dict['accuracy'][1]:.3f} | ±{stats_dict['balanced_acc'][1]:.3f} | "

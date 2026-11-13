@@ -13,7 +13,7 @@ import numpy as np
 
 # パス解決（learning ディレクトリ直下を参照可能にする）
 _CURRENT_DIR = Path(__file__).resolve().parent
-_LEARNING_DIR = _CURRENT_DIR.parent
+_LEARNING_DIR = _CURRENT_DIR.parent.parent
 if str(_LEARNING_DIR) not in sys.path:
     sys.path.insert(0, str(_LEARNING_DIR))
 

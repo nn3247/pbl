@@ -44,13 +44,36 @@ def compute_fold_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     threshold: float = 0.5,
+    true_threshold: float = 0.5,
 ) -> Dict:
-    """単一 Fold (被験者 1 名) の回帰および二値分類評価指標を算出します。"""
-    y_true_arr = np.asarray(y_true, dtype=float)
-    y_pred_arr = np.asarray(y_pred, dtype=float)
-    n_test = len(y_true_arr)
+    """単一 Fold (被験者 1 名) の回帰および二値分類評価指標を算出します（集計精度のため生値を返却）。"""
+    y_true_raw = np.asarray(y_true, dtype=float).ravel()
+    y_pred_raw = np.asarray(y_pred, dtype=float).ravel()
+    n_test = len(y_true_raw)
 
-    y_true_b = (y_true_arr >= threshold).astype(int)
+    valid_mask = np.isfinite(y_true_raw) & np.isfinite(y_pred_raw)
+    if not np.any(valid_mask):
+        return {
+            "fold": int(fold),
+            "test_user": str(test_user),
+            "n_test": int(n_test),
+            "optimal_threshold": float(threshold),
+            "mae": np.nan,
+            "rmse": np.nan,
+            "r2": np.nan,
+            "pearson_r": np.nan,
+            "spearman_rho": np.nan,
+            "acc_binary": np.nan,
+            "balanced_acc": np.nan,
+            "roc_auc": np.nan,
+            "pr_auc": np.nan,
+            "f1_macro": np.nan,
+        }
+
+    y_true_arr = y_true_raw[valid_mask]
+    y_pred_arr = y_pred_raw[valid_mask]
+
+    y_true_b = (y_true_arr >= true_threshold).astype(int)
     y_pred_b = (y_pred_arr >= threshold).astype(int)
     n_unique_y = len(np.unique(y_true_arr))
     n_classes = len(np.unique(y_true_b))
@@ -108,16 +131,17 @@ def compute_fold_metrics(
         "fold": int(fold),
         "test_user": str(test_user),
         "n_test": int(n_test),
-        "mae": round(mae, 4),
-        "rmse": round(rmse, 4),
-        "r2": round(r2_val, 4) if not np.isnan(r2_val) else np.nan,
-        "pearson_r": round(r_val, 4) if not np.isnan(r_val) else np.nan,
-        "spearman_rho": round(rho_val, 4) if not np.isnan(rho_val) else np.nan,
-        "acc_binary": round(acc, 4),
-        "balanced_acc": round(balanced_acc, 4) if not np.isnan(balanced_acc) else np.nan,
-        "roc_auc": round(auc_val, 4) if not np.isnan(auc_val) else np.nan,
-        "pr_auc": round(pr_auc_val, 4) if not np.isnan(pr_auc_val) else np.nan,
-        "f1_macro": round(f1_macro_val, 4) if not np.isnan(f1_macro_val) else np.nan,
+        "optimal_threshold": float(threshold),
+        "mae": mae,
+        "rmse": rmse,
+        "r2": float(r2_val) if not np.isnan(r2_val) else np.nan,
+        "pearson_r": float(r_val) if not np.isnan(r_val) else np.nan,
+        "spearman_rho": float(rho_val) if not np.isnan(rho_val) else np.nan,
+        "acc_binary": acc,
+        "balanced_acc": float(balanced_acc) if not np.isnan(balanced_acc) else np.nan,
+        "roc_auc": float(auc_val) if not np.isnan(auc_val) else np.nan,
+        "pr_auc": float(pr_auc_val) if not np.isnan(pr_auc_val) else np.nan,
+        "f1_macro": float(f1_macro_val) if not np.isnan(f1_macro_val) else np.nan,
     }
 
 
@@ -125,40 +149,74 @@ def compute_oof_and_fold_summary(
     y_true_all: np.ndarray,
     y_pred_all: np.ndarray,
     fold_records: List[Dict],
-    threshold: float = 0.5,
+    threshold: float | np.ndarray = 0.5,
+    true_threshold: float = 0.5,
 ) -> Dict:
     """全体 Out-Of-Fold (OOF) 指標および Fold 間 Mean ± Std を集計します。"""
-    y_true_arr = np.asarray(y_true_all, dtype=float)
-    y_pred_arr = np.asarray(y_pred_all, dtype=float)
+    y_true_raw = np.asarray(y_true_all, dtype=float).ravel()
+    y_pred_raw = np.asarray(y_pred_all, dtype=float).ravel()
 
-    mae_total = float(mean_absolute_error(y_true_arr, y_pred_arr))
-    rmse_total = float(np.sqrt(mean_squared_error(y_true_arr, y_pred_arr)))
-    r2_total = float(r2_score(y_true_arr, y_pred_arr))
-
-    if np.std(y_true_arr) > 1e-12 and np.std(y_pred_arr) > 1e-12:
-        r_total, p_val = pearsonr(y_true_arr, y_pred_arr)
-        rho_total, _ = spearmanr(y_true_arr, y_pred_arr)
-        r_total = float(r_total)
-        p_val = float(p_val)
-        rho_total = float(rho_total)
+    if np.ndim(threshold) == 0:
+        th_raw = np.full_like(y_pred_raw, float(threshold))
     else:
-        r_total, p_val, rho_total = 0.0, 1.0, 0.0
+        th_raw = np.asarray(threshold, dtype=float).ravel()
 
-    y_true_bin = (y_true_arr >= threshold).astype(int)
-    y_pred_bin = (y_pred_arr >= threshold).astype(int)
-    acc_total = float(accuracy_score(y_true_bin, y_pred_bin))
-    balanced_acc_total = float(balanced_accuracy_score(y_true_bin, y_pred_bin))
-    f1_macro_total = float(f1_score(y_true_bin, y_pred_bin, average="macro", zero_division=0))
+    valid_mask = np.isfinite(y_true_raw) & np.isfinite(y_pred_raw) & np.isfinite(th_raw)
+    if not np.any(valid_mask):
+        mae_total = rmse_total = r2_total = np.nan
+        r_total, p_val, rho_total = np.nan, 1.0, np.nan
+        acc_total = balanced_acc_total = f1_macro_total = auc_total = pr_auc_total = np.nan
+        th_arr = th_raw
+    else:
+        y_true_arr = y_true_raw[valid_mask]
+        y_pred_arr = y_pred_raw[valid_mask]
+        th_arr = th_raw[valid_mask]
 
-    try:
-        auc_total = float(roc_auc_score(y_true_bin, y_pred_arr))
-    except Exception:
-        auc_total = np.nan
+        mae_total = float(mean_absolute_error(y_true_arr, y_pred_arr))
+        rmse_total = float(np.sqrt(mean_squared_error(y_true_arr, y_pred_arr)))
+        try:
+            r2_total = float(r2_score(y_true_arr, y_pred_arr)) if len(np.unique(y_true_arr)) > 1 else np.nan
+        except Exception:
+            r2_total = np.nan
 
-    try:
-        pr_auc_total = float(average_precision_score(y_true_bin, y_pred_arr))
-    except Exception:
-        pr_auc_total = np.nan
+        if len(y_true_arr) > 1 and np.std(y_true_arr) > 1e-12 and np.std(y_pred_arr) > 1e-12:
+            r_total, p_val = pearsonr(y_true_arr, y_pred_arr)
+            rho_total, _ = spearmanr(y_true_arr, y_pred_arr)
+            r_total = float(r_total)
+            p_val = float(p_val)
+            rho_total = float(rho_total)
+        else:
+            r_total, p_val, rho_total = 0.0, 1.0, 0.0
+
+        y_true_bin = (y_true_arr >= true_threshold).astype(int)
+        y_pred_bin = (y_pred_arr >= th_arr).astype(int)
+        n_classes = len(np.unique(y_true_bin))
+        try:
+            acc_total = float(accuracy_score(y_true_bin, y_pred_bin))
+        except Exception:
+            acc_total = np.nan
+        try:
+            balanced_acc_total = float(balanced_accuracy_score(y_true_bin, y_pred_bin)) if n_classes > 1 else np.nan
+        except Exception:
+            balanced_acc_total = np.nan
+        try:
+            f1_macro_total = float(f1_score(y_true_bin, y_pred_bin, average="macro", zero_division=0))
+        except Exception:
+            f1_macro_total = np.nan
+
+        try:
+            auc_total = float(roc_auc_score(y_true_bin, y_pred_arr)) if n_classes > 1 else np.nan
+        except Exception:
+            auc_total = np.nan
+
+        try:
+            pr_auc_total = (
+                float(average_precision_score(y_true_bin, y_pred_arr))
+                if (n_classes > 1 and np.sum(y_true_bin == 1) > 0)
+                else np.nan
+            )
+        except Exception:
+            pr_auc_total = np.nan
 
     fold_df = pd.DataFrame(fold_records)
 
@@ -173,6 +231,7 @@ def compute_oof_and_fold_summary(
         return m_val, s_val
 
     stats_dict = {
+        "optimal_threshold": calc_mean_std("optimal_threshold"),
         "mae": calc_mean_std("mae"),
         "rmse": calc_mean_std("rmse"),
         "r2": calc_mean_std("r2"),
@@ -185,19 +244,41 @@ def compute_oof_and_fold_summary(
         "f1_macro": calc_mean_std("f1_macro"),
     }
 
+    mean_th = float(stats_dict["optimal_threshold"][0]) if not np.isnan(stats_dict["optimal_threshold"][0]) else float(np.nanmean(th_arr))
+    std_th = float(stats_dict["optimal_threshold"][1]) if not np.isnan(stats_dict["optimal_threshold"][1]) else float(np.nanstd(th_arr))
+
+    # 生値での集計完了後に、出力用 fold_df の指標列のみ小数第4位へ丸める
+    round_cols = [
+        "optimal_threshold", "mae", "rmse", "r2", "pearson_r", "spearman_rho",
+        "acc_binary", "balanced_acc", "roc_auc", "pr_auc", "f1_macro",
+    ]
+    for c in round_cols:
+        if c in fold_df.columns:
+            fold_df[c] = pd.to_numeric(fold_df[c], errors="coerce").round(4)
+
+    def _r4(val: float) -> float:
+        return round(float(val), 4) if np.isfinite(val) else np.nan
+
+    stats_dict_rounded = {
+        k: (_r4(v[0]), _r4(v[1]))
+        for k, v in stats_dict.items()
+    }
+
     return {
-        "mae": mae_total,
-        "rmse": rmse_total,
-        "r2": r2_total,
-        "pearson_r": r_total,
+        "optimal_threshold_mean": _r4(mean_th),
+        "optimal_threshold_std": _r4(std_th),
+        "mae": _r4(mae_total),
+        "rmse": _r4(rmse_total),
+        "r2": _r4(r2_total),
+        "pearson_r": _r4(r_total),
         "pearson_p": p_val,
-        "spearman_rho": rho_total,
-        "accuracy": acc_total,
-        "balanced_acc": balanced_acc_total,
-        "roc_auc": auc_total,
-        "pr_auc": pr_auc_total,
-        "f1_macro": f1_macro_total,
-        "stats_dict": stats_dict,
+        "spearman_rho": _r4(rho_total),
+        "accuracy": _r4(acc_total),
+        "balanced_acc": _r4(balanced_acc_total),
+        "roc_auc": _r4(auc_total),
+        "pr_auc": _r4(pr_auc_total),
+        "f1_macro": _r4(f1_macro_total),
+        "stats_dict": stats_dict_rounded,
         "fold_df": fold_df,
     }
 
@@ -210,6 +291,8 @@ def build_summary_row(model_name: str, eval_res: Dict, extra_fields: Dict | None
         row.update(extra_fields)
 
     row.update({
+        "optimal_threshold_mean": eval_res.get("optimal_threshold_mean", st.get("optimal_threshold", (0.5, 0.0))[0]),
+        "optimal_threshold_std": eval_res.get("optimal_threshold_std", st.get("optimal_threshold", (0.5, 0.0))[1]),
         "roc_auc": eval_res["roc_auc"],
         "roc_auc_mean": st["roc_auc"][0],
         "roc_auc_std": st["roc_auc"][1],
