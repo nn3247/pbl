@@ -130,7 +130,7 @@ export default function ConcentrationApp({ experimentPassword }: ConcentrationAp
             disabled={!consentScrolledToEnd}
             className="mt-4 w-full py-3 bg-blue-600 hover:bg-blue-500 rounded-lg font-bold text-lg disabled:opacity-40 disabled:cursor-not-allowed transition"
           >
-            内容を理解して同意する
+            内容を理解し、同意する
           </button>
         </div>
       </div>
