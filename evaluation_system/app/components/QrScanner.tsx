@@ -111,34 +111,40 @@ export default function QrScanner({ onScanSuccess, onError }: QrScannerProps) {
           // 各フレームごとのQRコード未検出は正常動作のため無視
         };
 
-        // デバイス一覧を取得して内カメラ（フロントカメラ）を優先選択
-        const cameras = await Html5Qrcode.getCameras().catch(() => []);
-        if (isCancelled) {
-          await stopAndReleaseCamera(scanner);
-          return;
-        }
-
-        let cameraConfig: string | { facingMode: string } = { facingMode: "user" };
-
-        if (cameras && cameras.length > 0) {
-          // 前面カメラ（front / user / facetime）があれば優先し、背面カメラは避ける
-          const frontCamera = cameras.find((c) =>
-            /front|user|facetime/i.test(c.label)
+        // 内カメラ（facingMode: "user"）を直接指定して起動
+        // （Html5Qrcode.getCameras() による全カメラ列挙を避け、フロントカメラを確実に要求・起動する）
+        try {
+          const p = scanner.start(
+            { facingMode: "user" },
+            config,
+            handleSuccess,
+            handleError
           );
-          if (frontCamera) {
-            cameraConfig = frontCamera.id;
-          } else {
-            const nonBackCamera = cameras.find(
-              (c) => c.label && !/back|rear|environment/i.test(c.label)
-            );
-            cameraConfig = nonBackCamera ? nonBackCamera.id : { facingMode: "user" };
+          startPromise = p;
+          await p;
+        } catch {
+          if (isCancelled) {
+            await stopAndReleaseCamera(scanner);
+            return;
           }
+          // facingMode: "user" で起動できない場合のフォールバック
+          const fallbackCameras = await Html5Qrcode.getCameras().catch(() => []);
+          if (isCancelled) {
+            await stopAndReleaseCamera(scanner);
+            return;
+          }
+          if (!fallbackCameras || fallbackCameras.length === 0) {
+            throw new Error("No cameras found");
+          }
+          const p = scanner.start(
+            fallbackCameras[0].id,
+            config,
+            handleSuccess,
+            handleError
+          );
+          startPromise = p;
+          await p;
         }
-
-        // カメラ起動のPromiseを保持
-        const p = scanner.start(cameraConfig, config, handleSuccess, handleError);
-        startPromise = p;
-        await p;
 
         if (isCancelled) {
           await stopAndReleaseCamera(scanner);
