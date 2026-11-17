@@ -111,7 +111,7 @@ export default function QrScanner({ onScanSuccess, onError }: QrScannerProps) {
           // 各フレームごとのQRコード未検出は正常動作のため無視
         };
 
-        // デバイス一覧を取得して最適なカメラを選択
+        // デバイス一覧を取得して内カメラ（フロントカメラ）を優先選択
         const cameras = await Html5Qrcode.getCameras().catch(() => []);
         if (isCancelled) {
           await stopAndReleaseCamera(scanner);
@@ -121,11 +121,18 @@ export default function QrScanner({ onScanSuccess, onError }: QrScannerProps) {
         let cameraConfig: string | { facingMode: string } = { facingMode: "user" };
 
         if (cameras && cameras.length > 0) {
-          // 背面カメラ（back / rear / environment）があれば優先
-          const backCamera = cameras.find((c) =>
-            /back|rear|environment/i.test(c.label)
+          // 前面カメラ（front / user / facetime）があれば優先し、背面カメラは避ける
+          const frontCamera = cameras.find((c) =>
+            /front|user|facetime/i.test(c.label)
           );
-          cameraConfig = backCamera ? backCamera.id : cameras[0].id;
+          if (frontCamera) {
+            cameraConfig = frontCamera.id;
+          } else {
+            const nonBackCamera = cameras.find(
+              (c) => c.label && !/back|rear|environment/i.test(c.label)
+            );
+            cameraConfig = nonBackCamera ? nonBackCamera.id : { facingMode: "user" };
+          }
         }
 
         // カメラ起動のPromiseを保持
