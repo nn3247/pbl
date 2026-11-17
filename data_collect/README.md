@@ -14,7 +14,7 @@
    - 顔が認識できない場合の即時警告ポップアップ表示。
 
 2. **動画再生に連動したデータ計測**
-   - **講義動画フェーズ:** 主な集中度データ収集(`class.mp4`)。
+   - **講義動画フェーズ:** 主な集中度データ収集(`clsss_long_.mp4`)。
    - **リラックス動画フェーズ:** 集中解放時のベースラインデータ収集(`campfire.mp4`)。
 
 3. **データ送信 & フォールバック機能**
@@ -66,8 +66,8 @@ sequenceDiagram
 data_collect
 │ 
 ├── README.md
-├── LICENSE
 ├── cors.json                 # Firebase Storage CORS設定
+├── .env.example
 │ 
 ├── app/
 │   ├── api/
@@ -90,7 +90,6 @@ data_collect
 │ 
 ├── public/
 │   ├── class_long.mp4        # 実験用講義動画（本編）
-│   ├── class_demo.mp4        # 講義動画（デモ用）
 │   └── campfire.mp4          # 実験用リラックス動画
 │ 
 └── content/ (またはAPI参照先)

@@ -28,17 +28,19 @@ except ImportError:
 
 try:
     from .pipeline import DownstreamTaskPipeline
+    from .threshold_decision import SUPPORTED_THRESHOLD_CRITERIA
     from .base_model import DEFAULT_BASE_MODELS
     from .meta_model import DEFAULT_META_MODELS
 except (ImportError, ValueError):
     from downstream_task.pipeline import DownstreamTaskPipeline
+    from downstream_task.threshold_decision import SUPPORTED_THRESHOLD_CRITERIA
     from downstream_task.base_model import DEFAULT_BASE_MODELS
     from downstream_task.meta_model import DEFAULT_META_MODELS
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="下流タスク LOSO-CV 2段階学習・推論 (Base Model [Visual/Vital] ➔ Meta Model)"
+        description="下流タスク LOSO-CV パイプライン (Step 7-0: Threshold Decision [Youden's J] ➔ Step 7-1: Base Model ➔ Step 7-2: Meta Model)"
     )
     parser.add_argument(
         "--config",
@@ -51,12 +53,13 @@ def main():
         nargs="+",
         choices=[
             "all",
+            "threshold_decision", "threshold", "th",
             "base_model", "base",
             "meta_model", "meta",
             "downstream_task", "downstream", "loso_cv", "loso",
         ],
         default=["all"],
-        help="実行ステージ: base_model (Visual/Vital各モデル作成) / meta_model (メタモデル作成) / all (両方)"
+        help="実行ステージ: threshold_decision (学習前閾値決定) / base_model / meta_model / all"
     )
     parser.add_argument(
         "--window-size",
@@ -65,6 +68,12 @@ def main():
         nargs="+",
         default=None,
         help="ウィンドウサイズの指定 (例: 10s / 5s 10s 15s / all)"
+    )
+    parser.add_argument(
+        "--criteria",
+        nargs="+",
+        default=None,
+        help=f"閾値決定基準 (デフォルト: youden_j, 選択肢: {list(SUPPORTED_THRESHOLD_CRITERIA)})"
     )
     parser.add_argument(
         "--modalities",
@@ -156,13 +165,28 @@ def main():
         target_windows = [default_ws]
 
     stages_set = {s.lower() for s in args.stage}
-    run_base = any(s in stages_set for s in ("all", "base_model", "base", "downstream_task", "downstream", "loso_cv", "loso"))
-    run_meta = any(s in stages_set for s in ("all", "meta_model", "meta", "downstream_task", "downstream", "loso_cv", "loso"))
+    run_th = any(
+        s in stages_set
+        for s in (
+            "all",
+            "threshold_decision", "threshold", "th",
+            "base_model", "base",
+            "downstream_task", "downstream", "loso_cv", "loso",
+        )
+    )
+    run_base = any(
+        s in stages_set
+        for s in ("all", "base_model", "base", "downstream_task", "downstream", "loso_cv", "loso")
+    )
+    run_meta = any(
+        s in stages_set
+        for s in ("all", "meta_model", "meta", "downstream_task", "downstream", "loso_cv", "loso")
+    )
 
     log.info("=" * 75)
-    log.info(" 🚀 [Downstream Task] LOSO-CV 2段階学習・推論パイプライン開始")
+    log.info(" 🚀 [Downstream Task] LOSO-CV 学習前閾値決定 (Youden's J) + 2段階学習・推論パイプライン開始")
     log.info(f" ⏱️ 対象ウィンドウサイズ : {target_windows}")
-    log.info(f" 🎯 実行ステージ         : Base={run_base}, Meta={run_meta}")
+    log.info(f" 🎯 実行ステージ         : ThresholdDecision={run_th}, Base={run_base}, Meta={run_meta}")
     log.info("=" * 75)
 
     total_start_time = time.time()
@@ -182,27 +206,24 @@ def main():
             )["stopping_rounds"] = args.early_stopping
 
         pipeline = DownstreamTaskPipeline(cfg)
-        if run_base and run_meta:
-            pipeline.run_downstream_task(
-                stage="all",
-                modalities=args.modalities,
-                base_models=args.base_models,
-                meta_models=args.meta_models,
-                visual_model=args.visual_model,
-                vital_model=args.vital_model,
+        th_res = None
+        if run_th:
+            th_res = pipeline.run_threshold_decision(
+                criteria=args.criteria,
                 weights=args.weights,
                 covariance_type=args.covariance_type,
                 apply_subject_norm=not args.no_subj_norm,
             )
-        elif run_base:
+        if run_base:
             pipeline.run_base_models(
                 modalities=args.modalities,
                 models=args.base_models,
                 weights=args.weights,
                 covariance_type=args.covariance_type,
                 apply_subject_norm=not args.no_subj_norm,
+                precomputed_folds=th_res,
             )
-        elif run_meta:
+        if run_meta:
             pipeline.run_meta_models(
                 models=args.meta_models,
                 visual_model=args.visual_model,

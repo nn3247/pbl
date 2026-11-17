@@ -32,6 +32,7 @@ try:
     from ..base_model.models import normalize_base_model_name
     from ..base_model.pipeline import BaseModelPipeline
     from ..metrics import build_summary_row, compute_oof_and_fold_summary
+    from ..threshold_decision.pipeline import load_saved_fold_thresholds
     from .models import DEFAULT_META_MODELS, normalize_meta_model_name
     from .reporter import plot_model_comparison, save_meta_model_comparison_report
     from .runner import run_single_meta_model_loso
@@ -39,6 +40,7 @@ except (ImportError, ValueError):
     from downstream_task.base_model.models import normalize_base_model_name
     from downstream_task.base_model.pipeline import BaseModelPipeline
     from downstream_task.metrics import build_summary_row, compute_oof_and_fold_summary
+    from downstream_task.threshold_decision.pipeline import load_saved_fold_thresholds
     from downstream_task.meta_model.models import DEFAULT_META_MODELS, normalize_meta_model_name
     from downstream_task.meta_model.reporter import plot_model_comparison, save_meta_model_comparison_report
     from downstream_task.meta_model.runner import run_single_meta_model_loso
@@ -185,17 +187,32 @@ class MetaModelPipeline:
 
         # メタデータ列のみ抽出
         drop_pred_cols = {
-            "y_gmm_soft_oof", "sample_weight_oof",
+            "y_gmm_soft_oof", "sample_weight_oof", "optimal_threshold", "threshold_criterion",
             "y_pred_visual_oof", "y_pred_vital_oof", "y_pred_oof", "y_pred_binary"
         }
         meta_cols = [c for c in vis_oof_df.columns if c not in drop_pred_cols]
         meta_df = vis_oof_df[meta_cols].copy()
+        subject_col = "username" if "username" in meta_df.columns else "subject_id"
         label_col = "label" if "label" in meta_df.columns else "label_mean"
         labels = meta_df[label_col].values.astype(float)
+        subjects = meta_df[subject_col].astype(str).values
 
-        # ベースモデル単体の参照メトリクス算出
-        vis_ref = compute_oof_and_fold_summary(labels, y_pred_vis, [])
-        vit_ref = compute_oof_and_fold_summary(labels, y_pred_vit, [])
+        # 学習前決定の最適閾値 th*_k の取得 (Base OOF CSV または threshold_decision/fold_optimal_thresholds.csv)
+        oof_thresholds: Optional[np.ndarray] = None
+        if "optimal_threshold" in vis_oof_df.columns and vis_oof_df["optimal_threshold"].notna().all():
+            oof_thresholds = vis_oof_df["optimal_threshold"].values.astype(np.float64)
+        else:
+            _, user_th_map = load_saved_fold_thresholds(self.output_dir.parent)
+            if user_th_map:
+                oof_thresholds = np.array(
+                    [float(user_th_map.get(str(u), 0.5)) for u in subjects],
+                    dtype=np.float64,
+                )
+
+        # ベースモデル単体の参照メトリクス算出 (学習前決定の最適閾値 th*_k を適用)
+        ref_th = oof_thresholds if oof_thresholds is not None else 0.5
+        vis_ref = compute_oof_and_fold_summary(labels, y_pred_vis, [], threshold=ref_th)
+        vit_ref = compute_oof_and_fold_summary(labels, y_pred_vit, [], threshold=ref_th)
         base_metrics_summary = {
             "visual": {"model_name": sel_vis, **vis_ref},
             "vital": {"model_name": sel_vital, **vit_ref},
@@ -209,6 +226,7 @@ class MetaModelPipeline:
         final_infer_df[f"y_pred_vital_{sel_vital}"] = y_pred_vit
 
         meta_preds_dict: Dict[str, np.ndarray] = {}
+        final_thresholds_arr: Optional[np.ndarray] = oof_thresholds
 
         for m_name in target_meta_models:
             res = run_single_meta_model_loso(
@@ -224,6 +242,7 @@ class MetaModelPipeline:
                 meta_output_dir=self.output_dir,
                 cfg=self.cfg,
                 log=log,
+                oof_thresholds=oof_thresholds,
             )
             row = build_summary_row(
                 model_name=res["model_name"],
@@ -240,16 +259,20 @@ class MetaModelPipeline:
             summary_rows.append(row)
             meta_preds_dict[res["model_name"]] = res["oof_preds"]
             final_infer_df[f"y_pred_meta_{res['model_name']}"] = res["oof_preds"]
+            if final_thresholds_arr is None and res.get("oof_thresholds") is not None:
+                final_thresholds_arr = res["oof_thresholds"]
 
-        # 3. 最終推論結果列 (final_prediction & final_label_pred) の付与と保存
+        # 3. 最終推論結果列 (final_prediction & final_binary_prediction) の付与と保存 (最適閾値 th*_k 適用)
         chosen_final = (
             default_final_model
             if default_final_model in meta_preds_dict
             else next(iter(meta_preds_dict.keys()))
         )
+        applied_th = final_thresholds_arr if final_thresholds_arr is not None else 0.5
+        final_infer_df["optimal_threshold"] = applied_th
         final_infer_df["final_meta_model"] = chosen_final
         final_infer_df["final_prediction"] = meta_preds_dict[chosen_final]
-        final_infer_df["final_binary_prediction"] = (meta_preds_dict[chosen_final] >= 0.5).astype(int)
+        final_infer_df["final_binary_prediction"] = (meta_preds_dict[chosen_final] >= applied_th).astype(int)
 
         final_csv = self.output_dir / "final_inference_predictions.csv"
         final_infer_df.to_csv(final_csv, index=False)

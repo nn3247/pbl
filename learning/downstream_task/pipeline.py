@@ -1,5 +1,5 @@
 """
-下流タスク 2段階 (Step 7-1: Base Model [Visual/Vital] ➔ Step 7-2: Meta Model) 統合パイプライン
+下流タスク 3段階 (Step 7-0: 学習前 閾値決定 [Youden's J] ➔ Step 7-1: Base Model [Visual/Vital] ➔ Step 7-2: Meta Model) 統合パイプライン
 (learning/downstream_task/pipeline.py)
 """
 
@@ -28,9 +28,11 @@ except ImportError:
         return {}
 
 try:
+    from .threshold_decision import ThresholdDecisionPipeline, SUPPORTED_THRESHOLD_CRITERIA
     from .base_model import BaseModelPipeline, DEFAULT_BASE_MODELS
     from .meta_model import MetaModelPipeline, DEFAULT_META_MODELS
 except (ImportError, ValueError):
+    from downstream_task.threshold_decision import ThresholdDecisionPipeline, SUPPORTED_THRESHOLD_CRITERIA
     from downstream_task.base_model import BaseModelPipeline, DEFAULT_BASE_MODELS
     from downstream_task.meta_model import MetaModelPipeline, DEFAULT_META_MODELS
 
@@ -40,11 +42,13 @@ DEFAULT_DOWNSTREAM_MODELS = DEFAULT_BASE_MODELS
 
 class DownstreamTaskPipeline:
     """
-    下流タスク LOSO-CV 2段階学習・推論パイプライン:
-      1. BaseModelPipeline : visual, vital 各モダリティで 5モデル (RF, XGB, LGBM, CatBoost, AdaBoost) を
-                             Early Stopping 付きで学習・評価 (report.md)・モデル保存
-      2. MetaModelPipeline : config.yaml で指定された visual, vital モデルを用いて
-                             4種のメタモデル (LogisticRegression, Ridge, Lasso, ElasticNet) を学習・評価・最終推論
+    下流タスク LOSO-CV 学習前閾値決定 + 2段階学習・推論パイプライン:
+      0. ThresholdDecisionPipeline : 学習前に各 LOSO Fold の Train データ (GMM ソフトラベル & 正解ラベル) から
+                                     Balanced Accuracy 最大化 (Youden's J Index: `youden_j`) で最適閾値 th*_k を決定
+      1. BaseModelPipeline         : 決定された最適閾値 th*_k を設定し、visual, vital 各モダリティで
+                                     5モデル (RF, XGB, LGBM, CatBoost, AdaBoost) を Early Stopping 付きで学習・評価・保存
+      2. MetaModelPipeline         : 決定された最適閾値 th*_k を設定し、選択された visual, vital モデルを用いて
+                                     4種のメタモデル (LogisticRegression, Ridge, Lasso, ElasticNet) を学習・評価・最終推論
     """
 
     def __init__(self, cfg: Optional[dict] = None):
@@ -52,8 +56,25 @@ class DownstreamTaskPipeline:
             cfg = load_config()
         self.cfg = cfg
         self.downstream_cfg = cfg.get("downstream_task", {})
+        self.th_cfg = self.downstream_cfg.get("threshold_decision", {})
+        self.threshold_pipeline = ThresholdDecisionPipeline(cfg)
         self.base_pipeline = BaseModelPipeline(cfg)
         self.meta_pipeline = MetaModelPipeline(cfg)
+
+    def run_threshold_decision(
+        self,
+        criteria: Optional[Sequence[str]] = None,
+        weights: Optional[Union[Tuple[float, float], List[float]]] = None,
+        covariance_type: Optional[str] = None,
+        apply_subject_norm: Optional[bool] = None,
+    ) -> Dict:
+        """Step 7-0: 学習前に Balanced Accuracy 最大化 (Youden's J Index) で各 Fold の最適閾値を決定・保存"""
+        return self.threshold_pipeline.run(
+            criteria=criteria,
+            weights=weights,
+            covariance_type=covariance_type,
+            apply_subject_norm=apply_subject_norm,
+        )
 
     def run_base_models(
         self,
@@ -62,14 +83,22 @@ class DownstreamTaskPipeline:
         weights: Optional[Union[Tuple[float, float], List[float]]] = None,
         covariance_type: Optional[str] = None,
         apply_subject_norm: Optional[bool] = None,
+        precomputed_folds: Optional[Dict] = None,
     ):
-        """Step 7-1: Visual / Vital 各モダリティのベースモデル群を学習・評価・保存"""
+        """Step 7-1: 学習前に決定された最適閾値 th*_k を用いて Visual / Vital ベースモデル群を学習・評価・保存"""
+        if precomputed_folds is None and bool(self.th_cfg.get("enabled", True)):
+            precomputed_folds = self.run_threshold_decision(
+                weights=weights,
+                covariance_type=covariance_type,
+                apply_subject_norm=apply_subject_norm,
+            )
         return self.base_pipeline.run(
             modalities=modalities,
             models=models,
             weights=weights,
             covariance_type=covariance_type,
             apply_subject_norm=apply_subject_norm,
+            precomputed_folds=precomputed_folds,
         )
 
     def run_meta_models(
@@ -78,7 +107,7 @@ class DownstreamTaskPipeline:
         visual_model: Optional[str] = None,
         vital_model: Optional[str] = None,
     ):
-        """Step 7-2: 選択されたベースモデルを用いてメタモデル群を学習・評価・最終推論"""
+        """Step 7-2: 選択されたベースモデルと最適閾値 th*_k を用いてメタモデル群を学習・評価・最終推論"""
         return self.meta_pipeline.run(
             models=models,
             visual_model=visual_model,
@@ -93,6 +122,7 @@ class DownstreamTaskPipeline:
         meta_models: Optional[Sequence[str]] = None,
         visual_model: Optional[str] = None,
         vital_model: Optional[str] = None,
+        threshold_criteria: Optional[Sequence[str]] = None,
         weights: Optional[Union[Tuple[float, float], List[float]]] = None,
         covariance_type: Optional[str] = None,
         apply_subject_norm: Optional[bool] = None,
@@ -100,22 +130,48 @@ class DownstreamTaskPipeline:
         **kwargs,
     ) -> Dict:
         """
-        指定ステージ ("base_model", "meta_model", または "all") に応じて実行します。
+        指定ステージ ("threshold_decision", "base_model", "meta_model", または "all") に応じて実行します。
+        学習実行時 ("all" や "base_model") は必ず学習前に Step 7-0: Threshold Decision (Youden's J) を実行します。
         """
         stage_norm = (stage or self.downstream_cfg.get("default_stage", "all")).lower().strip()
-        results = {}
+        results: Dict = {}
+        th_res: Optional[Dict] = None
 
-        if stage_norm in ("all", "base", "base_model", "base_models", "downstream_task", "loso_cv"):
+        th_enabled = bool(self.th_cfg.get("enabled", True))
+        explicit_th_stage = stage_norm in ("threshold_decision", "threshold", "th")
+        run_base = stage_norm in (
+            "all",
+            "base", "base_model", "base_models",
+            "downstream_task", "downstream", "loso_cv", "loso",
+        )
+        run_meta = stage_norm in (
+            "all",
+            "meta", "meta_model", "meta_models",
+            "downstream_task", "downstream", "loso_cv", "loso",
+        )
+        run_th = explicit_th_stage or (run_base and th_enabled)
+
+        if run_th:
+            th_res = self.run_threshold_decision(
+                criteria=threshold_criteria,
+                weights=weights,
+                covariance_type=covariance_type,
+                apply_subject_norm=apply_subject_norm,
+            )
+            results["threshold_decision"] = th_res
+
+        if run_base:
             df_base = self.run_base_models(
                 modalities=modalities,
                 models=base_models or models,
                 weights=weights,
                 covariance_type=covariance_type,
                 apply_subject_norm=apply_subject_norm,
+                precomputed_folds=th_res,
             )
             results["base_model"] = df_base
 
-        if stage_norm in ("all", "meta", "meta_model", "meta_models", "downstream_task", "loso_cv"):
+        if run_meta:
             df_meta = self.run_meta_models(
                 models=meta_models,
                 visual_model=visual_model,
@@ -134,21 +190,32 @@ LOSORegressionPipeline = DownstreamTaskPipeline
 
 def main():
     parser = argparse.ArgumentParser(
-        description="下流タスク LOSO-CV 2段階パイプライン (Base Model [Visual/Vital] ➔ Meta Model)"
+        description="下流タスク LOSO-CV パイプライン (Step 7-0: Threshold Decision [Youden's J] ➔ Step 7-1: Base Model ➔ Step 7-2: Meta Model)"
     )
     parser.add_argument("--config", type=str, default="config.yaml", help="設定YAMLファイル名")
     parser.add_argument(
         "--stage",
         type=str,
         default="all",
-        choices=["all", "base_model", "base", "meta_model", "meta"],
-        help="実行ステージ: base_model (Visual/Vitalモデル作成) / meta_model (メタモデル作成) / all (両方)"
+        choices=[
+            "all",
+            "threshold_decision", "threshold", "th",
+            "base_model", "base",
+            "meta_model", "meta",
+        ],
+        help="実行ステージ: threshold_decision (学習前閾値決定) / base_model / meta_model / all"
     )
     parser.add_argument(
         "--window-size", "--window-sizes", "-w",
         nargs="+",
         default=None,
         help="ウィンドウサイズ指定 (例: 10s / 5s 10s 15s / all)"
+    )
+    parser.add_argument(
+        "--criteria",
+        nargs="+",
+        default=None,
+        help=f"閾値決定基準 (デフォルト: youden_j, 選択肢: {list(SUPPORTED_THRESHOLD_CRITERIA)})"
     )
     parser.add_argument(
         "--modalities",
@@ -238,6 +305,7 @@ def main():
             meta_models=args.meta_models,
             visual_model=args.visual_model,
             vital_model=args.vital_model,
+            threshold_criteria=args.criteria,
             weights=args.weights,
             covariance_type=args.covariance_type,
             apply_subject_norm=not args.no_subj_norm,

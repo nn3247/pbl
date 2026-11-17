@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 # パス設定（単体実行時のフォールバック）
-_LEARNING_DIR = Path(__file__).resolve().parent.parent
+_LEARNING_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_LEARNING_DIR) not in sys.path:
     sys.path.insert(0, str(_LEARNING_DIR))
 
@@ -102,7 +102,7 @@ class ClusterAnalyzer:
 
         if "train" not in split_dfs:
             # フォールバック 1: PLS フォルダ内の Train 専用クラスタリング済みデータを探索
-            learning_root = Path(__file__).resolve().parent.parent
+            learning_root = Path(__file__).resolve().parent.parent.parent
             pls_dir = learning_root / "data" / "pls"
             pls_train_cand = pls_dir / f"pls_features_{self.window_size}_train_clustered.csv"
             if pls_train_cand.exists():
@@ -250,7 +250,7 @@ class ClusterAnalyzer:
         # 4. 生体指標プロファイルの集計 (split_dfs["train"] のみ)
         log.info("生体指標 (心拍数, EAR, 頭部・視線分散) のクラスタ別プロファイルを集計中 (split_dfs['train'] のみ)...")
         profiles = aggregate_cluster_profiles(df_train)
-        pls_dir = Path(__file__).resolve().parent.parent / "data" / "pls"
+        pls_dir = Path(__file__).resolve().parent.parent.parent / "data" / "pls"
 
         if not profiles.empty:
             log.info("\n" + profiles.to_string())

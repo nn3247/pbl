@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 
 import sys
-_LEARNING_DIR = Path(__file__).resolve().parent.parent
+_LEARNING_DIR = Path(__file__).resolve().parent.parent.parent
 if str(_LEARNING_DIR) not in sys.path:
     sys.path.insert(0, str(_LEARNING_DIR))
 

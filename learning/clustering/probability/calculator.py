@@ -92,6 +92,10 @@ class ProbabilityLabelCalculator:
 
             X_all = np.load(x_path)
             meta_all = pd.read_csv(meta_path) if meta_path.exists() else None
+            if meta_all is not None and len(meta_all) != len(X_all):
+                raise ValueError(
+                    f"metadata 行数 ({len(meta_all)}) と X_windows サンプル数 ({len(X_all)}) が一致しません。"
+                )
 
             stat_matrix, stat_names = compute_explicit_statistics(X_all, meta_df=meta_all)
             stat_df = pd.DataFrame(stat_matrix, columns=stat_names)
@@ -100,26 +104,27 @@ class ProbabilityLabelCalculator:
             if len(existing_stat_cols) == len(stat_names):
                 return df_meta
 
-            if meta_all is not None and "username" in meta_all.columns and "username" in df_meta.columns:
-                stat_df["username"] = meta_all["username"].astype(str)
-                pls_users = df_meta["username"].astype(str).unique()
-                matched_stat = []
-                for u in pls_users:
-                    u_count = (df_meta["username"].astype(str) == u).sum()
-                    u_stat = stat_df[stat_df["username"] == u].iloc[:u_count]
-                    matched_stat.append(u_stat[stat_names])
-                if matched_stat:
-                    matched_stat_df = pd.concat(matched_stat, ignore_index=True)
-                    if len(matched_stat_df) == len(df_meta):
-                        for col in stat_names:
-                            df_meta[col] = matched_stat_df[col].values
-                        log.info(f"  ✓ GMM疑似クラスタリング後に明示的物理特徴量 ({len(stat_names)}次元) を結合しました")
-                        return df_meta
+            if meta_all is not None and len(meta_all) == len(stat_df):
+                from clustering.analysis.metrics import _align_features_by_keys
+                aligned_df = _align_features_by_keys(
+                    target_df=df_meta,
+                    source_meta=meta_all,
+                    source_features=stat_df,
+                )
+                for col in stat_names:
+                    df_meta[col] = aligned_df[col].values
+                log.info(f"  ✓ キー結合により明示的物理特徴量 ({len(stat_names)}次元) を結合しました")
+                return df_meta
 
             if len(stat_df) == len(df_meta):
                 for col in stat_names:
                     df_meta[col] = stat_df[col].values
-                log.info(f"  ✓ GMM疑似クラスタリング後に明示的物理特徴量 ({len(stat_names)}次元) を結合しました")
+                log.info(f"  ✓ 明示的物理特徴量 ({len(stat_names)}次元) を結合しました")
+            else:
+                raise ValueError(
+                    f"特徴量行数 ({len(stat_df)}) とメタデータ行数 ({len(df_meta)}) が一致せず、"
+                    "キー結合用の metadata.csv も利用できません。"
+                )
         except Exception as e:
             log.warning(f"⚠️ 明示的特徴量の結合中に警告が発生しました: {e}")
 
@@ -215,6 +220,9 @@ class ProbabilityLabelCalculator:
             np.save(y_std_path, y_soft)
             log.info(f"  💾 標準ターゲット配列保存: {y_std_path.name} {y_soft.shape}")
 
+            probs_path = self.data_dir / f"probs_{split_name}.npy"
+            np.save(probs_path, probs)
+
             pls_dir = _LEARNING_DIR / "data" / "pls"
             if pls_dir.exists():
                 np.save(pls_dir / f"y_soft_{self.window_size}_{split_name}.npy", y_soft)
@@ -282,25 +290,22 @@ class ProbabilityLabelCalculator:
                 c1_ratio = float(np.mean(y_train_task[c1_mask])) if np.any(c1_mask) else 0.0
                 c0_ratio = float(np.mean(y_train_task[c0_mask])) if np.any(c0_mask) else 0.0
 
-                y_soft_train = raw_results["train"]["y_soft"]
-                y_soft_val = raw_results["val"]["y_soft"] if "val" in raw_results else None
-                y_soft_test = raw_results["test"]["y_soft"] if "test" in raw_results else None
-
                 # クラスタ0の方が集中タスク割合が高い場合、クラスタ定義が逆転している
                 inverted = bool(c0_ratio > c1_ratio)
-                if c0_ratio > c1_ratio:
-                    # クラスタ1が「集中」になるよう、全スプリットのソフトラベルを反転
-                    y_soft_train = 1.0 - y_soft_train
-                    if y_soft_val is not None:
-                        y_soft_val = 1.0 - y_soft_val
-                    if y_soft_test is not None:
-                        y_soft_test = 1.0 - y_soft_test
-
-                raw_results["train"]["y_soft"] = y_soft_train
-                if y_soft_val is not None:
-                    raw_results["val"]["y_soft"] = y_soft_val
-                if y_soft_test is not None:
-                    raw_results["test"]["y_soft"] = y_soft_test
+                if inverted:
+                    # クラスタ1が「集中」になるよう、全スプリットのラベル・確率列自体を入れ替えた上でソフトラベルを再計算
+                    for res in raw_results.values():
+                        swapped_probs = np.asarray(res["probs"], dtype=np.float64)[:, [1, 0]]
+                        res["probs"] = swapped_probs
+                        d_meta = res["df_meta"]
+                        if "cluster" in d_meta.columns:
+                            d_meta["cluster"] = 1 - d_meta["cluster"].astype(int)
+                        else:
+                            d_meta["cluster"] = np.argmax(swapped_probs, axis=1)
+                        if "cluster_prob_0" in d_meta.columns and "cluster_prob_1" in d_meta.columns:
+                            d_meta["cluster_prob_0"] = swapped_probs[:, 0]
+                            d_meta["cluster_prob_1"] = swapped_probs[:, 1]
+                        res["y_soft"] = compute_soft_labels(swapped_probs, res["weights"])
 
                 log.info(
                     f"GMM Alignment: c1_ratio={c1_ratio:.3f}, c0_ratio={c0_ratio:.3f} -> (Inverted: {inverted})"

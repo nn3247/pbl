@@ -6,7 +6,7 @@
 
 ## 主要な技術スタック
 
-### フロントエンド(`data_collect`, `tetris`)
+### フロントエンド(`data_collect`, `evaluation_system`)
 
 ![Next.js](https://img.shields.io/badge/Next.js-000000?style=flat-square&logo=next.js&logoColor=white)
 ![React](https://img.shields.io/badge/React-20232A?style=flat-square&logo=react&logoColor=61DAFB)
