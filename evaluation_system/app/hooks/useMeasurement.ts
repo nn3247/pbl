@@ -30,7 +30,7 @@ interface UseMeasurementOptions {
   experienced?:      0 | 1; // 1: 協力した, 0: していない
 }
 
-type Phase = "idle" | "calibrating" | "watching_video" | "ending_video";
+type Phase = "idle" | "calibrating" | "watching_video" | "ending_video" | "submitting";
 
 interface UseMeasurementResult {
   phase:             Phase;
@@ -89,7 +89,15 @@ export function useMeasurement({
   const videoStart                = useRef<number | null>(null);
   const endingVideoStart          = useRef<number | null>(null);
 
-  const lastFrameTime  = useRef(0);
+  const lastFrameTime    = useRef(0);
+  const redirectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const clearRedirectTimer = useCallback(() => {
+    if (redirectTimerRef.current !== null) {
+      clearTimeout(redirectTimerRef.current);
+      redirectTimerRef.current = null;
+    }
+  }, []);
 
   useEffect(() => { phaseRef.current          = phase;          }, [phase]);
   useEffect(() => { isFaceDetectedRef.current = isFaceDetected; }, [isFaceDetected]);
@@ -115,11 +123,14 @@ export function useMeasurement({
   }, []);
 
   useEffect(() => {
-    return () => { if (requestRef.current) cancelAnimationFrame(requestRef.current); };
-  }, []);
+    return () => {
+      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      clearRedirectTimer();
+    };
+  }, [clearRedirectTimer]);
 
   /** フレームデータを収集する共通処理 */
-  const collectFrame = (
+  const collectFrame = useCallback((
     ctx: CanvasRenderingContext2D | null,
     lm: NormalizedLandmark[] | null,
     elapsedSec: number,
@@ -140,7 +151,45 @@ export function useMeasurement({
       landmarks,
       landmarkCentroid,
     });
-  };
+  }, [videoMode]);
+
+  /** キャリブレーション経過時間を更新し、完了時に動画再生フェーズへ遷移する */
+  const advanceCalibration = useCallback((nowMs: number, frameTimestamp: number) => {
+    if (phaseRef.current !== "calibrating" || calibrationStart.current === null) return;
+
+    const elapsed   = (nowMs - calibrationStart.current) / 1000;
+    const remaining = Math.max(0, CALIBRATION_DURATION - elapsed);
+    setCalibrationTime(remaining);
+
+    if (elapsed < CALIBRATION_DURATION) return;
+
+    const landmarkFrames = calibrationLandmarkFrames.current;
+    const n              = landmarkFrames.length;
+    const meanLandmarks  = averageLandmarks(landmarkFrames);
+    if (n > 0 && meanLandmarks) {
+      calibrationStatsRef.current = { durationSec: CALIBRATION_DURATION, frameCount: n, meanLandmarks };
+    }
+    capturedData.current              = [];
+    calibrationLandmarkFrames.current = [];
+    calibrationStart.current          = null;
+    videoStart.current                = frameTimestamp;
+
+    phaseRef.current = "watching_video";
+    setPhase("watching_video");
+    setStatus("動画再生中...（音声が流れています。音量調節をしてください）");
+
+    const mVideo = measureVideoRef.current;
+    if (mVideo) {
+      mVideo.muted = false;
+      mVideo.currentTime = 0;
+      mVideo.play().catch((playErr) => {
+        console.error("動画再生エラー:", playErr);
+        phaseRef.current = "idle";
+        setPhase("idle");
+        setStatus("再生エラー");
+      });
+    }
+  }, [measureVideoRef]);
 
   const predictWebcamRef = useRef<((timestamp: number) => void) | null>(null);
 
@@ -153,6 +202,9 @@ export function useMeasurement({
     if (timestamp - lastFrameTime.current < FRAME_INTERVAL) return;
     lastFrameTime.current = timestamp;
 
+    // 顔検出やカメラフレームの更新状態に関わらず、キャリブレーションタイマーを確実に進める
+    advanceCalibration(performance.now(), timestamp);
+
     const video          = videoRef.current;
     const canvas         = canvasRef.current;
     const mVideo         = measureVideoRef.current;
@@ -161,7 +213,7 @@ export function useMeasurement({
     if (!video || !canvas || !faceLandmarker) return;
     if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0 || video.currentTime === lastVideoTime.current) return;
 
-    const ctx = canvas.getContext("2d");
+    const ctx = canvas.getContext("2d", { willReadFrequently: true });
     if (!ctx) return;
 
     // 💡 Canvas サイズが変わった時だけ再設定（不要な再アロケーションを防止）
@@ -188,40 +240,10 @@ export function useMeasurement({
       const lm = hasFace ? results.faceLandmarks[0] : null;
 
       if (phaseRef.current === "calibrating") {
-        if (lm && calibrationStart.current !== null) {
+        if (lm) {
           const landmarks = extractLandmarks(lm);
           if (landmarks) {
             calibrationLandmarkFrames.current.push(landmarks);
-            const elapsed   = (timestamp - calibrationStart.current) / 1000;
-            const remaining = Math.max(0, CALIBRATION_DURATION - elapsed);
-            setCalibrationTime(remaining);
-
-            if (elapsed >= CALIBRATION_DURATION) {
-              const landmarkFrames = calibrationLandmarkFrames.current;
-              const n              = landmarkFrames.length;
-              const meanLandmarks  = averageLandmarks(landmarkFrames);
-              if (n > 0 && meanLandmarks) {
-                calibrationStatsRef.current = { durationSec: CALIBRATION_DURATION, frameCount: n, meanLandmarks };
-              }
-              capturedData.current              = [];
-              calibrationLandmarkFrames.current = [];
-              calibrationStart.current          = null;
-              videoStart.current                = timestamp;
-
-              phaseRef.current = "watching_video";
-              setPhase("watching_video");
-              setStatus("動画再生中...（音声が流れています。音量調節をしてください）");
-
-              if (mVideo) {
-                mVideo.muted = false;
-                mVideo.currentTime = 0;
-                mVideo.play().catch((playErr) => {
-                  console.error("動画再生エラー:", playErr);
-                  setPhase("idle");
-                  setStatus("再生エラー");
-                });
-              }
-            }
           }
         }
       }
@@ -246,7 +268,7 @@ export function useMeasurement({
     } catch (err) {
       console.warn("[MediaPipe] Detection error:", err);
     }
-  }, [videoRef, canvasRef, measureVideoRef, endVideoRef, faceLandmarkerRef, mode]);
+  }, [videoRef, canvasRef, measureVideoRef, endVideoRef, faceLandmarkerRef, mode, advanceCalibration, collectFrame]);
 
   useEffect(() => {
     predictWebcamRef.current = predictWebcam;
@@ -273,6 +295,7 @@ export function useMeasurement({
 
   /** 計測開始 */
   const startMeasurement = useCallback(() => {
+    clearRedirectTimer();
     capturedData.current              = [];
     calibrationLandmarkFrames.current = [];
     calibrationStatsRef.current       = null;
@@ -286,11 +309,23 @@ export function useMeasurement({
 
     if (mVideo) {
       mVideo.muted = false;
-      mVideo.play().then(() => { mVideo.pause(); mVideo.currentTime = 0; }).catch((e) => console.log(e));
+      mVideo.volume = 1.0;
+      mVideo.play().then(() => {
+        if (phaseRef.current === "calibrating") {
+          mVideo.pause();
+          mVideo.currentTime = 0;
+        }
+      }).catch((e) => console.log(e));
     }
     if (mode === "normal" && eVideo) {
       eVideo.muted = false;
-      eVideo.play().then(() => { eVideo.pause(); eVideo.currentTime = 0; }).catch((e) => console.log(e));
+      eVideo.volume = 1.0;
+      eVideo.play().then(() => {
+        if (phaseRef.current === "calibrating") {
+          eVideo.pause();
+          eVideo.currentTime = 0;
+        }
+      }).catch((e) => console.log(e));
     }
 
     phaseRef.current = "calibrating";
@@ -298,19 +333,41 @@ export function useMeasurement({
     setIsFaceDetected(true);
     setCalibrationTime(CALIBRATION_DURATION);
     setStatus("キャリブレーション中...");
-  }, [measureVideoRef, endVideoRef, mode]);
+  }, [measureVideoRef, endVideoRef, mode, clearRedirectTimer]);
 
   /** データ保存・送信 & アンケート遷移の共通処理 */
   const finishSession = useCallback(async () => {
     endingVideoStart.current = null;
-    phaseRef.current         = "idle";
-    setPhase("idle");
     setRemainingTime(null);
+    clearRedirectTimer();
 
     if (capturedData.current.length === 0) {
+      phaseRef.current = "idle";
+      setPhase("idle");
       setStatus("計測データがありません");
       return;
     }
+
+    // 保存・送信〜リダイレクト完了まで操作を無効化
+    phaseRef.current = "submitting";
+    setPhase("submitting");
+
+    const scheduleSurveyRedirect = (
+      subjectId: string,
+      delayMs: number,
+      redirectMessage: string,
+      fallbackMessage: string
+    ) => {
+      const timerId = redirectToSurvey(subjectId, delayMs);
+      if (timerId !== null) {
+        redirectTimerRef.current = timerId;
+        setStatus(redirectMessage);
+      } else {
+        phaseRef.current = "idle";
+        setPhase("idle");
+        setStatus(fallbackMessage);
+      }
+    };
 
     // 💡 1セッション固有の10桁の被験者IDを発行
     const subjectId = generateSubjectId(10);
@@ -318,8 +375,12 @@ export function useMeasurement({
     if (!currentUser) {
       console.warn("⚠️ 認証トークン未取得のためローカルへ保存します");
       downloadMeasurementJson(capturedData.current, calibrationStatsRef.current ?? undefined, videoMode, subjectId, experienced);
-      setStatus("未認証のため計測データをローカルに保存しました。アンケートへ移動します...");
-      redirectToSurvey(subjectId, 3000);
+      scheduleSurveyRedirect(
+        subjectId,
+        3000,
+        "未認証のため計測データをローカルに保存しました。アンケートへ移動します...",
+        "未認証のため計測データをローカルに保存しました。"
+      );
       return;
     }
 
@@ -337,9 +398,12 @@ export function useMeasurement({
         );
 
         // 💡 アップロード成功直後にフィードバックを表示し、Googleフォームへ自動遷移
-        const completeMessage = "データを保存しました。アンケートへ移動します...";
-        setStatus(completeMessage);
-        redirectToSurvey(subjectId, 1800);
+        scheduleSurveyRedirect(
+          subjectId,
+          1800,
+          "データを保存しました。アンケートへ移動します...",
+          "データを保存しました。"
+        );
       } else {
         throw new Error("Firebase Storageが初期化されていません");
       }
@@ -347,10 +411,14 @@ export function useMeasurement({
       console.error("アップロードエラー:", err);
       // 💡 送信失敗時はローカルにJSONをダウンロード保存し、ダウンロード後にアンケートへ自動遷移
       downloadMeasurementJson(capturedData.current, calibrationStatsRef.current ?? undefined, videoMode, subjectId, experienced);
-      setStatus("送信に失敗したため、計測データをローカルに保存しました。アンケートへ移動します...");
-      redirectToSurvey(subjectId, 3000);
+      scheduleSurveyRedirect(
+        subjectId,
+        3000,
+        "送信に失敗したため、計測データをローカルに保存しました。アンケートへ移動します...",
+        "送信に失敗したため、計測データをローカルに保存しました。"
+      );
     }
-  }, [currentUser, videoMode, experienced]);
+  }, [currentUser, videoMode, experienced, clearRedirectTimer]);
 
   /** 最初の動画（normal: cnn.mp4 / custom: ts2vec.mp4）終了時 */
   const handleVideoEnd = useCallback(() => {
@@ -378,6 +446,7 @@ export function useMeasurement({
       eVideo.currentTime = 0;
       eVideo.play().catch((err) => {
         console.error("リラックス動画再生エラー:", err);
+        phaseRef.current = "idle";
         setPhase("idle");
         setStatus("再生エラー");
       });

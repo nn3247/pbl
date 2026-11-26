@@ -45,30 +45,36 @@ export default function ConcentrationApp({ experimentPassword }: ConcentrationAp
   const [privacyContent, setPrivacyContent] = useState("");
   const [introContent,   setIntroContent]   = useState("");
 
-  // ── 各種Markdownのfetch ──────────────────────────────────
+  // ── 各種Markdownの一括fetch ──────────────────────────────────
   useEffect(() => {
     if (!experimentPassword) return;
 
-    const fetchHeaders = {
-      "x-experiment-password": experimentPassword,
+    let cancelled = false;
+    fetch("/api/content?file=all", {
+      headers: {
+        "x-experiment-password": experimentPassword,
+      },
+    })
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((d: { contents?: Record<string, string> }) => {
+        if (cancelled) return;
+        const contents = d.contents ?? {};
+        setConsentContent(contents.informed_consent ?? "取得できませんでした");
+        setTermsContent(contents.terms ?? "取得できませんでした");
+        setPrivacyContent(contents.privacy ?? "取得できませんでした");
+        setIntroContent(contents.introduction ?? "取得できませんでした");
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setConsentContent("取得できませんでした");
+        setTermsContent("取得できませんでした");
+        setPrivacyContent("取得できませんでした");
+        setIntroContent("取得できませんでした");
+      });
+
+    return () => {
+      cancelled = true;
     };
-
-    fetch("/api/content?file=informed_consent", { headers: fetchHeaders })
-      .then((r) => r.json())
-      .then((d) => setConsentContent(d.content ?? "取得できませんでした"));
-
-    fetch("/api/content?file=terms", { headers: fetchHeaders })
-      .then((r) => r.json())
-      .then((d) => setTermsContent(d.content ?? "取得できませんでした"));
-      
-    fetch("/api/content?file=privacy", { headers: fetchHeaders })
-      .then((r) => r.json())
-      .then((d) => setPrivacyContent(d.content ?? "取得できませんでした"));
-      
-    fetch("/api/content?file=introduction", { headers: fetchHeaders })
-      .then((r) => r.json())
-      .then((d) => setIntroContent(d.content ?? "取得できませんでした"));
-      
   }, [experimentPassword]);
 
   // ── スクロール位置のリセットと末尾検知 ──────────────────────
