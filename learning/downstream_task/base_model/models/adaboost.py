@@ -55,7 +55,7 @@ class AdaBoostBaseRegressor(BaseModalityRegressor):
         early_stopping_rounds: Optional[int] = None,
         feature_names: Optional[List[str]] = None,
     ) -> "AdaBoostBaseRegressor":
-        X_tr = np.asarray(X_train, dtype=np.float32)
+        X_tr = np.nan_to_num(np.asarray(X_train, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         y_tr = np.asarray(y_train, dtype=np.float64)
         self.feature_names = (
             list(feature_names)
@@ -85,7 +85,7 @@ class AdaBoostBaseRegressor(BaseModalityRegressor):
 
         n_fitted = len(self.model.estimators_)
         if X_val is not None and y_val is not None and len(y_val) > 0 and stop_rounds > 0 and n_fitted > 1:
-            X_v = np.asarray(X_val, dtype=np.float32)
+            X_v = np.nan_to_num(np.asarray(X_val, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
             y_v = np.asarray(y_val, dtype=np.float64)
 
             best_loss = float("inf")
@@ -112,6 +112,10 @@ class AdaBoostBaseRegressor(BaseModalityRegressor):
             self.best_iteration_ = n_fitted
 
         return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X_clean = np.nan_to_num(np.asarray(X, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        return super().predict(X_clean)
 
     def get_feature_importance(
         self,

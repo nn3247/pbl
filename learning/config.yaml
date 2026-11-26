@@ -134,6 +134,20 @@ downstream_task:
   # 特徴量設定 (true: PLS潜在特徴量 + 明示的物理統計量 / false: PLS潜在特徴量のみ)
   use_explicit_features: true
 
+  # GMM (ソフトラベル生成) モード:
+  #   - "class_conditional": クラス条件付きGMM (gmm_0: k=1, gmm_1: k=2, diag, reg_covar=1e-4)
+  #   - "unsupervised": 従来の教師なしGMM (k=2)
+  gmm_mode: "class_conditional"
+  # クラス条件付きGMMの事前確率 ("balanced": 0.5/0.5, "empirical": Trainクラス比率)
+  gmm_prior: "balanced"
+
+  # パターン⑤: Vital TS2Vec 埋め込み自体も HRV なし版 (preprocess/data/windowed) とし、
+  # HRV 4指標は明示的特徴量としてのみ追加する (HRV明示追加のみ)
+  use_no_hrv_bio_embeddings_for_base: true
+
+  # GMM (ソフトラベル生成) 時のみ HRV 除外版の生体埋め込み (preprocess/data/windowed) を使用する設定
+  exclude_hrv_in_gmm: true
+
   # 不均衡補正ペナルティ重み (少数派クラス/非集中に対する重み倍率)
   imbalance_penalty: 4.0
 

@@ -35,10 +35,18 @@ except ImportError:
         return {}
 
 try:
-    from ..data_loader import load_embeddings_and_meta, load_explicit_features
+    from ..data_loader import (
+        load_embeddings_and_meta,
+        load_explicit_features,
+        load_gmm_bio_embeddings_no_hrv,
+    )
     from ..base_model.runner import LOSOFoldData, prepare_loso_folds
 except (ImportError, ValueError):
-    from downstream_task.data_loader import load_embeddings_and_meta, load_explicit_features
+    from downstream_task.data_loader import (
+        load_embeddings_and_meta,
+        load_explicit_features,
+        load_gmm_bio_embeddings_no_hrv,
+    )
     from downstream_task.base_model.runner import LOSOFoldData, prepare_loso_folds
 
 from .criteria import SUPPORTED_THRESHOLD_CRITERIA, normalize_criterion_name
@@ -224,6 +232,30 @@ class ThresholdDecisionPipeline:
                 window_size=ws,
                 log=log,
             )
+            use_no_hrv_bio_for_base = bool(self.downstream_cfg.get("use_no_hrv_bio_embeddings_for_base", False))
+            exclude_hrv_in_gmm = bool(self.downstream_cfg.get("exclude_hrv_in_gmm", True))
+            if use_no_hrv_bio_for_base:
+                emb_bio = load_gmm_bio_embeddings_no_hrv(
+                    meta_df=meta_df,
+                    input_data_dir=input_data_dir,
+                    learning_root=self.learning_root,
+                    window_size=ws,
+                    log=log,
+                )
+                emb_bio_gmm = None
+                log.info("✓ [パターン⑤: HRV明示追加のみ] Vital TS2Vec 埋め込みに HRV なし版を使用し、HRV は明示的特徴量としてのみ追加します。")
+            else:
+                emb_bio_gmm = (
+                    load_gmm_bio_embeddings_no_hrv(
+                        meta_df=meta_df,
+                        input_data_dir=input_data_dir,
+                        learning_root=self.learning_root,
+                        window_size=ws,
+                        log=log,
+                    )
+                    if exclude_hrv_in_gmm
+                    else None
+                )
             explicit_feats, explicit_names = load_explicit_features(
                 meta_df=meta_df,
                 input_data_dir=input_data_dir,
@@ -245,6 +277,7 @@ class ThresholdDecisionPipeline:
                 weights=w_tuple,
                 apply_subject_norm=subj_norm,
                 compute_thresholds=False,
+                emb_bio_gmm=emb_bio_gmm,
             )
 
         subject_col = "username" if "username" in meta_df.columns else "subject_id"

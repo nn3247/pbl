@@ -29,7 +29,11 @@ except ImportError:
         return {}
 
 try:
-    from ..data_loader import load_embeddings_and_meta, load_explicit_features
+    from ..data_loader import (
+        load_embeddings_and_meta,
+        load_explicit_features,
+        load_gmm_bio_embeddings_no_hrv,
+    )
     from ..metrics import build_summary_row
     from ..threshold_decision.criteria import normalize_criterion_name
     from ..threshold_decision.pipeline import load_saved_fold_thresholds
@@ -42,7 +46,11 @@ try:
     )
     from .runner import prepare_loso_folds, run_single_base_model_loso
 except (ImportError, ValueError):
-    from downstream_task.data_loader import load_embeddings_and_meta, load_explicit_features
+    from downstream_task.data_loader import (
+        load_embeddings_and_meta,
+        load_explicit_features,
+        load_gmm_bio_embeddings_no_hrv,
+    )
     from downstream_task.metrics import build_summary_row
     from downstream_task.threshold_decision.criteria import normalize_criterion_name
     from downstream_task.threshold_decision.pipeline import load_saved_fold_thresholds
@@ -173,6 +181,30 @@ class BaseModelPipeline:
                 window_size=self.window_size,
                 log=log,
             )
+            use_no_hrv_bio_for_base = bool(self.downstream_cfg.get("use_no_hrv_bio_embeddings_for_base", False))
+            exclude_hrv_in_gmm = bool(self.downstream_cfg.get("exclude_hrv_in_gmm", True))
+            if use_no_hrv_bio_for_base:
+                emb_bio = load_gmm_bio_embeddings_no_hrv(
+                    meta_df=meta_df,
+                    input_data_dir=self.input_data_dir,
+                    learning_root=self.learning_root,
+                    window_size=self.window_size,
+                    log=log,
+                )
+                emb_bio_gmm = None
+                log.info("✓ [パターン⑤: HRV明示追加のみ] Vital TS2Vec 埋め込みに HRV なし版を使用し、HRV は明示的特徴量としてのみ追加します。")
+            else:
+                emb_bio_gmm = (
+                    load_gmm_bio_embeddings_no_hrv(
+                        meta_df=meta_df,
+                        input_data_dir=self.input_data_dir,
+                        learning_root=self.learning_root,
+                        window_size=self.window_size,
+                        log=log,
+                    )
+                    if exclude_hrv_in_gmm
+                    else None
+                )
             explicit_feats, explicit_names = load_explicit_features(
                 meta_df=meta_df,
                 input_data_dir=self.input_data_dir,
@@ -195,6 +227,7 @@ class BaseModelPipeline:
                 cov_type=cov_type,
                 weights=w_tuple,
                 apply_subject_norm=subj_norm,
+                emb_bio_gmm=emb_bio_gmm,
             )
 
             # Step 7-0 が有効かつ同一基準の保存済み閾値ファイルがある場合のみ同期 (旧基準や無効設定時の上書きを防止)
