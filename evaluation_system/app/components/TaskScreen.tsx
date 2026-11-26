@@ -5,7 +5,7 @@
 
 "use client";
 
-import React, { useRef, useEffect } from "react";
+import React, { useRef } from "react";
 import { useFaceLandmarker } from "../hooks/useFaceLandmarker";
 import { useWebcam }         from "../hooks/useWebcam";
 import { useMeasurement }    from "../hooks/useMeasurement";
@@ -65,35 +65,8 @@ export default function TaskScreen({
   const handleStartCamera = () => startCamera(startLoop);
 
   const handleStartMeasurement = () => {
-    const mVideo = measureVideoRef.current;
-    const eVideo = endVideoRef.current;
-    if (mVideo) {
-      mVideo.muted = false;
-      mVideo.volume = 1.0;
-      mVideo.play().then(() => {
-        mVideo.pause();
-        mVideo.currentTime = 0;
-      }).catch((err) => console.log(err));
-    }
-    if (eVideo && endVideoSrc) {
-      eVideo.muted = false;
-      eVideo.volume = 1.0;
-      eVideo.play().then(() => {
-        eVideo.pause();
-        eVideo.currentTime = 0;
-      }).catch((err) => console.log(err));
-    }
     startMeasurement();
   };
-
-  useEffect(() => {
-    if (isEndingVideo && endVideoRef.current && endVideoSrc) {
-      const video = endVideoRef.current;
-      video.muted = false;
-      video.currentTime = 0;
-      video.play().catch((err) => console.error(err));
-    }
-  }, [isEndingVideo, phase, endVideoSrc]);
 
   const isModelLoading = !isReady;
 

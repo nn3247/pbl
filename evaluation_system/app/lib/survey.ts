@@ -33,20 +33,24 @@ export function buildSurveyFormUrl(subjectId: string): string | null {
 
 /**
  * 指定ミリ秒待機後にGoogleフォームへ同一タブでリダイレクトする
- * 
+ *
  * @param subjectId 被験者ID
  * @param delayMs リダイレクトまでの待機時間 (ミリ秒)
+ * @returns キャンセル用タイマーID (リダイレクトをスキップした場合は null)
  */
-export function redirectToSurvey(subjectId: string, delayMs = 1500): void {
+export function redirectToSurvey(
+  subjectId: string,
+  delayMs = 1500
+): ReturnType<typeof setTimeout> | null {
   const targetUrl = buildSurveyFormUrl(subjectId);
   if (!targetUrl) {
     console.warn("⚠️ [Survey] 遷移先URLが取得できなかったためリダイレクトをスキップします");
-    return;
+    return null;
   }
 
-  if (typeof window === "undefined") return;
+  if (typeof window === "undefined") return null;
 
-  setTimeout(() => {
+  return setTimeout(() => {
     window.location.href = targetUrl;
   }, delayMs);
 }
