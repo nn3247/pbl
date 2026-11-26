@@ -24,7 +24,7 @@ except ImportError:
 
 from ..data_loader import load_clustering_data
 from ..decision import determine_optimal_clusters
-from .trainer import fit_gmm
+from .trainer import fit_class_conditional_gmm, fit_gmm
 from .predictor import apply_and_save_clusters
 from .plotter import plot_pca_clusters
 
@@ -108,25 +108,49 @@ class GMMClustering:
         log.info(f"🔒 [Leakage-Free] GMM の学習 (fit) は previous_task 標準化済み Train データのみ (N={len(X_train)}) で実行します")
 
         # 2. クラスタ数 K & 共分散タイプの決定
-        k, cov_type = self.get_or_determine_model_params(n_clusters=n_clusters, X_train=X_train, covariance_type=covariance_type)
-        if k is None:
-            log.error("❌ クラスタ数を決定できませんでした。処理を中断します。")
-            return False
+        gmm_mode = str(self.gmm_cfg.get("mode", "class_conditional")).strip().lower()
+        if gmm_mode == "class_conditional":
+            k = 2
+            cov_type = covariance_type or self.gmm_cfg.get("covariance_type", "diag")
+            label_col = "label" if "label" in split_data["train"]["meta"].columns else "label_mean"
+            y_train = split_data["train"]["meta"][label_col].values.astype(float)
+            log.info(f"使用モデル設定: mode='class_conditional', 共分散タイプ='{cov_type}'")
 
-        log.info(f"使用モデル設定: k = {k}, 共分散タイプ = '{cov_type}'")
+            # 3. クラス条件付き GMM モデルの学習 (Train のみ)
+            gmm = fit_class_conditional_gmm(
+                X_train=X_train,
+                y_train=y_train,
+                n_components_neg=int(self.gmm_cfg.get("n_components_neg", 1)),
+                n_components_pos=int(self.gmm_cfg.get("n_components_pos", 2)),
+                cov_type=cov_type,
+                reg_covar=float(self.gmm_cfg.get("reg_covar", 1e-4)),
+                prior_mode=str(self.gmm_cfg.get("prior_mode", "balanced")),
+                logit_clip=float(self.gmm_cfg.get("logit_clip", 50.0)),
+                random_state=int(self.gmm_cfg.get("random_state", 42)),
+                max_iter=int(self.gmm_cfg.get("max_iter", 100)),
+                n_init=1,
+            )
+            model_save_path = self.model_dir / f"gmm_model_{self.window_size}_cc_{cov_type}.joblib"
+        else:
+            k, cov_type = self.get_or_determine_model_params(n_clusters=n_clusters, X_train=X_train, covariance_type=covariance_type)
+            if k is None:
+                log.error("❌ クラスタ数を決定できませんでした。処理を中断します。")
+                return False
 
-        # 3. GMM モデルの学習 (Train のみ)
-        gmm = fit_gmm(
-            X_train=X_train,
-            n_clusters=k,
-            cov_type=cov_type,
-            random_state=self.gmm_cfg.get("random_state", 42),
-            max_iter=self.gmm_cfg.get("max_iter", 100),
-            n_init=self.gmm_cfg.get("n_init", 5),
-        )
+            log.info(f"使用モデル設定: mode='unsupervised', k = {k}, 共分散タイプ = '{cov_type}'")
+
+            # 3. 教師なし GMM モデルの学習 (Train のみ)
+            gmm = fit_gmm(
+                X_train=X_train,
+                n_clusters=k,
+                cov_type=cov_type,
+                random_state=self.gmm_cfg.get("random_state", 42),
+                max_iter=self.gmm_cfg.get("max_iter", 100),
+                n_init=self.gmm_cfg.get("n_init", 5),
+            )
+            model_save_path = self.model_dir / f"gmm_model_{self.window_size}_k{k}_{cov_type}.joblib"
 
         # 4. モデル保存
-        model_save_path = self.model_dir / f"gmm_model_{self.window_size}_k{k}_{cov_type}.joblib"
         joblib.dump(gmm, model_save_path)
         log.info(f"💾 GMM モデルを保存しました: {model_save_path}")
 

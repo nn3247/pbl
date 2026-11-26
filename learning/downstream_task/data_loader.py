@@ -17,6 +17,7 @@ import pandas as pd
 VITAL_KEYWORDS = (
     "bpm",
     "bvp",
+    "hrv",
     "hr",
     "ibi",
     "rmssd",
@@ -272,6 +273,51 @@ def load_embeddings_and_meta(
     )
 
 
+def _append_hrv_features_if_needed(
+    base_matrix: Optional[np.ndarray],
+    base_names: List[str],
+    meta_df: pd.DataFrame,
+    data_dir: Path,
+    window_size: str,
+    log,
+) -> Tuple[Optional[np.ndarray], List[str]]:
+    """既存の明示的特徴量に HRV 4大指標 (mean_pp, rmssd, sdnn, sd2_sd1) が含まれていなければ追加する"""
+    if base_matrix is None or not base_names:
+        return base_matrix, base_names
+
+    try:
+        from features import HRV_FEATURE_NAMES, compute_causal_hrv_features
+    except Exception as e:
+        log.warning(f"⚠️ HRV 特徴量モジュールの読み込みをスキップします: {e}")
+        return base_matrix, base_names
+
+    if all(name in base_names for name in HRV_FEATURE_NAMES):
+        return base_matrix, base_names
+
+    try:
+        cache_path = data_dir / f"hrv_features_{window_size}.csv"
+        hrv_matrix, hrv_names = compute_causal_hrv_features(
+            meta_df=meta_df,
+            window_size=window_size,
+            window_sec=45.0,
+            fs=50.0,
+            min_peaks=10,
+            cache_path=cache_path,
+            log=log,
+        )
+        missing_indices = [i for i, n in enumerate(hrv_names) if n not in base_names]
+        if missing_indices:
+            add_mat = hrv_matrix[:, missing_indices]
+            add_names = [hrv_names[i] for i in missing_indices]
+            combined_mat = np.concatenate([base_matrix, add_mat], axis=1).astype(np.float32)
+            combined_names = list(base_names) + add_names
+            return combined_mat, combined_names
+    except Exception as e:
+        log.warning(f"⚠️ HRV 特徴量の算出をスキップします: {e}")
+
+    return base_matrix, base_names
+
+
 def load_explicit_features(
     meta_df: pd.DataFrame,
     input_data_dir: Path,
@@ -279,7 +325,7 @@ def load_explicit_features(
     window_size: str,
     log,
 ) -> Tuple[Optional[np.ndarray], List[str]]:
-    """明示的物理特徴量 (20次元: EAR, 頭部姿勢, 視線, BPM統計量) をロードまたは算出"""
+    """明示的物理特徴量 (EAR, 頭部姿勢, 視線, BPM統計量 + 過去45秒 HRV 4指標) をロードまたは算出"""
     # 1. すでに meta_df に明示的特徴量が含まれている場合
     exclude_cols = {
         "username", "subject_id", "label", "label_mean", "target_label",
@@ -296,7 +342,9 @@ def load_explicit_features(
     ]
     if len(stat_cols) >= 15:
         log.info(f"✓ メタデータから直接 {len(stat_cols)} 次元の明示的物理特徴量を検出しました: {stat_cols[:4]} ...")
-        return meta_df[stat_cols].values.astype(np.float32), stat_cols
+        return _append_hrv_features_if_needed(
+            meta_df[stat_cols].values.astype(np.float32), stat_cols, meta_df, data_dir, window_size, log
+        )
 
     # 1b. Split 別 meta_*_soft_labeled.csv に統計量列が含まれている場合
     soft_meta_dfs = []
@@ -316,7 +364,9 @@ def load_explicit_features(
         if len(s_cols) >= 15:
             if len(combined_soft) == len(meta_df) and "username" not in meta_df.columns:
                 log.info(f"✓ meta_*_soft_labeled.csv から {len(s_cols)} 次元の明示的物理特徴量を検出しました")
-                return combined_soft[s_cols].values.astype(np.float32), s_cols
+                return _append_hrv_features_if_needed(
+                    combined_soft[s_cols].values.astype(np.float32), s_cols, meta_df, data_dir, window_size, log
+                )
             elif "username" in meta_df.columns and "username" in combined_soft.columns:
                 try:
                     from clustering.analysis.metrics import _align_features_by_keys
@@ -326,7 +376,9 @@ def load_explicit_features(
                         source_features=combined_soft[s_cols],
                     )
                     log.info(f"✓ meta_*_soft_labeled.csv からキー結合により {len(s_cols)} 次元の明示的物理特徴量を検出しました")
-                    return aligned_soft.values.astype(np.float32), s_cols
+                    return _append_hrv_features_if_needed(
+                        aligned_soft.values.astype(np.float32), s_cols, meta_df, data_dir, window_size, log
+                    )
                 except ValueError as ve:
                     log.warning(f"⚠️ meta_*_soft_labeled.csv のキー結合をスキップします: {ve}")
 
@@ -384,15 +436,20 @@ def load_explicit_features(
                 log.info(
                     f"✓ X_windows.npy からキー結合により {len(stat_names)} 次元の明示的物理特徴量を算出しました"
                 )
-                return aligned_df.values.astype(np.float32), stat_names
+                base_matrix = aligned_df.values.astype(np.float32)
+                base_names = stat_names
             elif len(stat_matrix) == len(meta_df):
                 log.info(f"✓ X_windows.npy から {len(stat_names)} 次元の明示的物理特徴量を算出しました")
-                return stat_matrix.astype(np.float32), stat_names
+                base_matrix = stat_matrix.astype(np.float32)
+                base_names = stat_names
             else:
                 raise ValueError(
                     f"X_windows サンプル数 ({len(stat_matrix)}) と meta_df 行数 ({len(meta_df)}) が一致せず、"
                     "キー結合用の metadata.csv も利用できません。"
                 )
+            return _append_hrv_features_if_needed(
+                base_matrix, base_names, meta_df, data_dir, window_size, log
+            )
     except Exception as e:
         log.warning(f"明示的特徴量の取得をスキップします: {e}")
 

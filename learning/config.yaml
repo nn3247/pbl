@@ -66,7 +66,14 @@ clustering:
 
   # GMM パラメータ
   gmm:
-    covariance_type: "full"  # "full", "tied", "diag", "spherical"
+    mode: "class_conditional"  # "class_conditional" (教師あり) / "unsupervised" (従来の教師なし)
+    input_mode: "vis_pls"      # "vis_pls" (bio_pls除外) / "vis_pls_hrv_mean_pp" / "all_pls"
+    n_components_neg: 1        # y==0 (非集中) 側 GMM コンポーネント数
+    n_components_pos: 2        # y==1 (集中) 側 GMM コンポーネント数
+    covariance_type: "diag"    # "diag" (class_conditional推奨), "full", "tied", "spherical"
+    reg_covar: 1.0e-4          # 共分散正則化項
+    prior_mode: "balanced"     # "balanced" (π0=π1=0.5) / "empirical" (Trainクラス比率)
+    logit_clip: 50.0           # 対数オッズのクリップ上限/下限
     random_state: 42
     max_iter: 100
     n_init: 5
@@ -169,6 +176,16 @@ downstream_task:
       - "visual"
       - "vital"
 
+    # Vital ベースモデル厳選特徴量 (bio_pls_1..3 & bpm_diff_std を除外し、Z標準化値 + 絶対乖離度 |z| の計7次元)
+    vital_selected_features:
+      - "hrv_mean_pp"
+      - "hrv_sdnn"
+      - "hrv_rmssd"
+      - "bpm_base_mean"
+      - "hrv_mean_pp_abs"
+      - "hrv_sdnn_abs"
+      - "hrv_rmssd_abs"
+
     # 学習対象のベース回帰モデル一覧 (全て回帰 + Early Stopping 適用)
     models:
       - "random_forest"
@@ -250,10 +267,11 @@ downstream_task:
   # ----------------------------------------------------------------------------
   meta_model:
     # ★ Visual / Vital それぞれで採用するベースモデルをここで指定 ★
-    # 指定可能: "random_forest", "xgboost", "lightgbm", "catboost", "adaboost"
+    # "auto" を指定すると base_model/report.md (最高 ROC-AUC) のモデルを自動採用します
+    # 個別指定も可能: "random_forest", "xgboost", "lightgbm", "catboost", "adaboost"
     selected_base_models:
-      visual: "lightgbm"
-      vital: "lightgbm"
+      visual: "auto"
+      vital: "auto"
 
     # 作成・評価するメタモデル一覧
     models:

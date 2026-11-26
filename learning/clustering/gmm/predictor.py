@@ -25,6 +25,8 @@ except ImportError:
     log = logging.getLogger("clustering.gmm.predictor")
 
 from ..probability.core import compute_soft_labels, generate_default_weights
+from .class_conditional import ClassConditionalGMM
+from .class_conditional import ClassConditionalGMM
 
 
 def apply_and_save_clusters(
@@ -84,7 +86,10 @@ def apply_and_save_clusters(
         }
 
     # 2. GMMクラスタ自動アライメント（Label Switching防止・Trainデータのみ参照で完全リークフリー）
-    if n_clusters == 2 and "train" in split_infer:
+    #    ※ クラス条件付き GMM ではクラスと分布が明示的に対応しているため反転判定をスキップ
+    if isinstance(gmm, ClassConditionalGMM):
+        log.info("ℹ️ クラス条件付き GMM のため、2クラスタ反転判定 (GMM Alignment) をスキップします。")
+    elif n_clusters == 2 and "train" in split_infer:
         df_train_meta = split_infer["train"]["df_meta"]
         label_col = (
             "label"

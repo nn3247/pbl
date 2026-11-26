@@ -15,6 +15,7 @@ from sklearn.mixture import GaussianMixture
 from sklearn.model_selection import GroupShuffleSplit, LeaveOneGroupOut, train_test_split
 
 try:
+    from ...clustering.gmm.class_conditional import ClassConditionalGMM
     from ..data_loader import (
         build_modality_feature_names,
         split_modality_feature_indices,
@@ -26,6 +27,7 @@ try:
     from .models import create_base_model, normalize_base_model_name
     from .reporter import generate_visualizations, save_markdown_report
 except (ImportError, ValueError):
+    from clustering.gmm.class_conditional import ClassConditionalGMM
     from downstream_task.data_loader import (
         build_modality_feature_names,
         split_modality_feature_indices,
@@ -36,6 +38,11 @@ except (ImportError, ValueError):
     from downstream_task.threshold_decision.criteria import find_optimal_threshold, normalize_criterion_name
     from downstream_task.base_model.models import create_base_model, normalize_base_model_name
     from downstream_task.base_model.reporter import generate_visualizations, save_markdown_report
+
+try:
+    from clustering.gmm.class_conditional import ClassConditionalGMM
+except ImportError:
+    from ...clustering.gmm.class_conditional import ClassConditionalGMM
 
 
 @dataclass
@@ -89,13 +96,29 @@ def prepare_loso_folds(
 
     dt_cfg = cfg.get("downstream_task", {}) if cfg else {}
     loso_cfg = cfg.get("loso_cv", {}) if cfg else {}
+    gmm_cfg = cfg.get("clustering", {}).get("gmm", {}) if cfg else {}
     bm_cfg = dt_cfg.get("base_model", {})
     es_cfg = bm_cfg.get("early_stopping", {})
     th_cfg = dt_cfg.get("threshold_decision", {})
 
-    seed = int(loso_cfg.get("random_state", dt_cfg.get("random_state", 42)))
+    seed = int(loso_cfg.get("random_state", dt_cfg.get("random_state", gmm_cfg.get("random_state", 42))))
     imbalance_penalty = float(dt_cfg.get("imbalance_penalty", 4.0))
     use_explicit = bool(dt_cfg.get("use_explicit_features", True))
+
+    gmm_mode = str(dt_cfg.get("gmm_mode", gmm_cfg.get("mode", "class_conditional"))).strip().lower()
+    gmm_input_mode = str(gmm_cfg.get("input_mode", dt_cfg.get("gmm_input_mode", "vis_pls"))).strip().lower()
+    cc_k_neg = int(gmm_cfg.get("n_components_neg", 1))
+    cc_k_pos = int(gmm_cfg.get("n_components_pos", 2))
+    cc_cov = str(gmm_cfg.get("covariance_type", "diag"))
+    cc_reg = float(gmm_cfg.get("reg_covar", 1e-4))
+    cc_prior = str(dt_cfg.get("gmm_prior", gmm_cfg.get("prior_mode", "balanced"))).strip().lower()
+    cc_clip = float(gmm_cfg.get("logit_clip", 50.0))
+
+    raw_vital_sel = bm_cfg.get("vital_selected_features", None)
+    vital_selected_features: Optional[List[str]] = (
+        [str(x) for x in raw_vital_sel] if raw_vital_sel else None
+    )
+
     val_ratio = float(es_cfg.get("val_ratio", 0.2))
     group_split = bool(es_cfg.get("group_split", True))
 
@@ -130,6 +153,24 @@ def prepare_loso_folds(
         n_explicit=n_explicit,
     )
 
+    exp_name_list: List[str] = (
+        [str(c) for c in explicit_names]
+        if (explicit_names is not None and n_explicit > 0)
+        else [f"explicit_{i+1}" for i in range(n_explicit)]
+    )
+    abs_base_cols = ["hrv_mean_pp", "hrv_sdnn", "hrv_rmssd"]
+    abs_source_indices = [
+        (f"{col}_abs", exp_name_list.index(col))
+        for col in abs_base_cols
+        if col in exp_name_list
+    ]
+
+    if vital_selected_features:
+        available_vital_pool = set(vital_feat_names) | {abs_name for abs_name, _ in abs_source_indices}
+        resolved_vital = [name for name in vital_selected_features if name in available_vital_pool]
+        if resolved_vital:
+            vital_feat_names = resolved_vital
+
     logo = LeaveOneGroupOut()
     folds_data: List[LOSOFoldData] = []
     n_samples = len(meta_df)
@@ -141,18 +182,30 @@ def prepare_loso_folds(
         train_sub_users = subjects[train_idx]
         test_sub_users = subjects[test_idx]
 
-        # A. Fold 内 DualStream PLS
+        # A. PLS 前の被験者別 Z スコア標準化 (32次元埋め込みの個人差ベースラインを除去)
+        if apply_subject_norm:
+            vis_tr_in = standardize_subject_wise(emb_vis[train_idx], train_sub_users)
+            vis_te_in = standardize_subject_wise(emb_vis[test_idx], test_sub_users)
+            bio_tr_in = standardize_subject_wise(emb_bio[train_idx], train_sub_users)
+            bio_te_in = standardize_subject_wise(emb_bio[test_idx], test_sub_users)
+        else:
+            vis_tr_in = emb_vis[train_idx].astype(np.float32)
+            vis_te_in = emb_vis[test_idx].astype(np.float32)
+            bio_tr_in = emb_bio[train_idx].astype(np.float32)
+            bio_te_in = emb_bio[test_idx].astype(np.float32)
+
+        # B. Fold 内 DualStream PLS (符号整列済み; PLS 後の重複標準化は行わない)
         if actual_vis_comps < emb_vis.shape[1] or actual_bio_comps < emb_bio.shape[1]:
             if fold == 1 and log is not None:
                 log.info(
-                    f"✓ Fold 内 DualStream PLS を実行します "
+                    f"✓ [Pre-PLS Subject Norm={apply_subject_norm}] Fold 内 DualStream PLS を実行します "
                     f"(Visual: {emb_vis.shape[1]}d -> {actual_vis_comps}d, "
                     f"Vital: {emb_bio.shape[1]}d -> {actual_bio_comps}d)"
                 )
             pls = DualStreamPLS(n_vis=actual_vis_comps, n_bio=actual_bio_comps)
-            pls.fit(emb_vis[train_idx], emb_bio[train_idx], labels[train_idx])
-            z_train = pls.transform(emb_vis[train_idx], emb_bio[train_idx])
-            z_test = pls.transform(emb_vis[test_idx], emb_bio[test_idx])
+            pls.fit(vis_tr_in, bio_tr_in, labels[train_idx])
+            z_train_norm = pls.transform(vis_tr_in, bio_tr_in)
+            z_test_norm = pls.transform(vis_te_in, bio_te_in)
         else:
             if fold == 1 and log is not None:
                 log.warning(
@@ -160,33 +213,78 @@ def prepare_loso_folds(
                     f"PLS目標次元 ({actual_vis_comps}d, {actual_bio_comps}d) 以下のため、"
                     f"Fold 内 DualStream PLS をスキップします。"
                 )
-            z_train = np.concatenate([emb_vis[train_idx], emb_bio[train_idx]], axis=1).astype(np.float32)
-            z_test = np.concatenate([emb_vis[test_idx], emb_bio[test_idx]], axis=1).astype(np.float32)
+            z_train_norm = np.concatenate([vis_tr_in, bio_tr_in], axis=1).astype(np.float32)
+            z_test_norm = np.concatenate([vis_te_in, bio_te_in], axis=1).astype(np.float32)
 
-        # B. 被験者別 Zスコア標準化
-        if apply_subject_norm:
-            z_train_norm = standardize_subject_wise(z_train, train_sub_users)
-            z_test_norm = standardize_subject_wise(z_test, test_sub_users)
+        # 明示的物理特徴量の被験者別 Z スコア標準化 (+ 絶対乖離度 |z| の算出)
+        stat_train_norm: Optional[np.ndarray] = None
+        stat_test_norm: Optional[np.ndarray] = None
+        abs_train_dict: Dict[str, np.ndarray] = {}
+        abs_test_dict: Dict[str, np.ndarray] = {}
+        if use_exp_arr is not None:
+            if apply_subject_norm:
+                stat_train_norm = standardize_subject_wise(use_exp_arr[train_idx], train_sub_users)
+                stat_test_norm = standardize_subject_wise(use_exp_arr[test_idx], test_sub_users)
+            else:
+                stat_train_norm = use_exp_arr[train_idx].astype(np.float32)
+                stat_test_norm = use_exp_arr[test_idx].astype(np.float32)
+            for abs_name, src_idx in abs_source_indices:
+                abs_train_dict[abs_name] = np.abs(stat_train_norm[:, src_idx]).astype(np.float32)
+                abs_test_dict[abs_name] = np.abs(stat_test_norm[:, src_idx]).astype(np.float32)
+
+        # C. Fold 内 GMM fit & ソフトラベル算出 (Train のみで学習 / 入力クリーン化対応)
+        if gmm_input_mode == "vis_pls":
+            z_gmm_train = z_train_norm[:, :actual_vis_comps]
+            z_gmm_test = z_test_norm[:, :actual_vis_comps]
+        elif gmm_input_mode == "vis_pls_hrv_mean_pp" and stat_train_norm is not None and "hrv_mean_pp" in exp_name_list:
+            h_idx = exp_name_list.index("hrv_mean_pp")
+            h_tr = np.nan_to_num(stat_train_norm[:, [h_idx]], nan=0.0)
+            h_te = np.nan_to_num(stat_test_norm[:, [h_idx]], nan=0.0)
+            z_gmm_train = np.concatenate([z_train_norm[:, :actual_vis_comps], h_tr], axis=1).astype(np.float32)
+            z_gmm_test = np.concatenate([z_test_norm[:, :actual_vis_comps], h_te], axis=1).astype(np.float32)
         else:
-            z_train_norm = z_train
-            z_test_norm = z_test
+            z_gmm_train = z_train_norm
+            z_gmm_test = z_test_norm
 
-        # C. Fold 内 GMM fit & ソフトラベル算出
-        gmm = GaussianMixture(n_components=2, covariance_type=cov_type, random_state=seed)
-        gmm.fit(z_train_norm)
-        gmm_probs_train = gmm.predict_proba(z_train_norm)
-        gmm_probs_test = gmm.predict_proba(z_test_norm)
+        if gmm_mode == "class_conditional":
+            if fold == 1 and log is not None:
+                log.info(
+                    f"✓ [Class-Conditional GMM] input='{gmm_input_mode}' ({z_gmm_train.shape[1]}d), "
+                    f"gmm_0(k={cc_k_neg}), gmm_1(k={cc_k_pos}), cov='{cc_cov}', "
+                    f"reg_covar={cc_reg}, prior_mode='{cc_prior}' (2クラスタ反転判定スキップ)"
+                )
+            cc_gmm = ClassConditionalGMM(
+                n_components_neg=cc_k_neg,
+                n_components_pos=cc_k_pos,
+                covariance_type=cc_cov,
+                reg_covar=cc_reg,
+                prior_mode=cc_prior,
+                logit_clip=cc_clip,
+                random_state=seed,
+            ).fit(z_gmm_train, labels[train_idx])
 
-        r0 = np.corrcoef(gmm_probs_train[:, 0], labels[train_idx])[0, 1]
-        r1 = np.corrcoef(gmm_probs_train[:, 1], labels[train_idx])[0, 1]
-        r0 = 0.0 if np.isnan(r0) else r0
-        r1 = 0.0 if np.isnan(r1) else r1
+            gmm_probs_train = cc_gmm.predict_proba(z_gmm_train)
+            gmm_probs_test = cc_gmm.predict_proba(z_gmm_test)
 
-        focus_c = 1 if r1 > r0 else 0
-        relax_c = 1 - focus_c
+            # クラス 1 (集中) と クラス 0 (非集中) が明示的に対応しているため反転判定は不要
+            y_soft_train = (gmm_probs_train[:, 1] * weights[0] + gmm_probs_train[:, 0] * weights[1]).astype(np.float32)
+            y_soft_test = (gmm_probs_test[:, 1] * weights[0] + gmm_probs_test[:, 0] * weights[1]).astype(np.float32)
+        else:
+            gmm = GaussianMixture(n_components=2, covariance_type=cov_type, random_state=seed)
+            gmm.fit(z_gmm_train)
+            gmm_probs_train = gmm.predict_proba(z_gmm_train)
+            gmm_probs_test = gmm.predict_proba(z_gmm_test)
 
-        y_soft_train = (gmm_probs_train[:, focus_c] * weights[0] + gmm_probs_train[:, relax_c] * weights[1]).astype(np.float32)
-        y_soft_test = (gmm_probs_test[:, focus_c] * weights[0] + gmm_probs_test[:, relax_c] * weights[1]).astype(np.float32)
+            r0 = np.corrcoef(gmm_probs_train[:, 0], labels[train_idx])[0, 1]
+            r1 = np.corrcoef(gmm_probs_train[:, 1], labels[train_idx])[0, 1]
+            r0 = 0.0 if np.isnan(r0) else r0
+            r1 = 0.0 if np.isnan(r1) else r1
+
+            focus_c = 1 if r1 > r0 else 0
+            relax_c = 1 - focus_c
+
+            y_soft_train = (gmm_probs_train[:, focus_c] * weights[0] + gmm_probs_train[:, relax_c] * weights[1]).astype(np.float32)
+            y_soft_test = (gmm_probs_test[:, focus_c] * weights[0] + gmm_probs_test[:, relax_c] * weights[1]).astype(np.float32)
 
         conf_w_train = np.max(gmm_probs_train, axis=1)
         imb_w_train = y_soft_train * 1.0 + (1.0 - y_soft_train) * imbalance_penalty
@@ -199,14 +297,8 @@ def prepare_loso_folds(
         oof_gmm_soft[test_idx] = y_soft_test
         oof_sample_weight[test_idx] = sample_weights_test
 
-        # D. 明示的物理特徴量の結合 & モダリティ分離
-        if use_exp_arr is not None:
-            if apply_subject_norm:
-                stat_train_norm = standardize_subject_wise(use_exp_arr[train_idx], train_sub_users)
-                stat_test_norm = standardize_subject_wise(use_exp_arr[test_idx], test_sub_users)
-            else:
-                stat_train_norm = use_exp_arr[train_idx]
-                stat_test_norm = use_exp_arr[test_idx]
+        # D. モダリティ分離 (Visual: vis_pls + 視覚明示特徴 / Vital: 厳選された7次元)
+        if stat_train_norm is not None and stat_test_norm is not None:
             X_train_full = np.concatenate([z_train_norm, stat_train_norm], axis=1)
             X_test_full = np.concatenate([z_test_norm, stat_test_norm], axis=1)
         else:
@@ -215,8 +307,26 @@ def prepare_loso_folds(
 
         X_train_visual = X_train_full[:, vis_indices].astype(np.float32)
         X_test_visual = X_test_full[:, vis_indices].astype(np.float32)
-        X_train_vital = X_train_full[:, vital_indices].astype(np.float32)
-        X_test_vital = X_test_full[:, vital_indices].astype(np.float32)
+
+        if vital_selected_features and stat_train_norm is not None and stat_test_norm is not None:
+            tr_cols, te_cols = [], []
+            for fname in vital_feat_names:
+                if fname in abs_train_dict:
+                    tr_cols.append(abs_train_dict[fname])
+                    te_cols.append(abs_test_dict[fname])
+                elif fname in exp_name_list:
+                    idx_e = exp_name_list.index(fname)
+                    tr_cols.append(stat_train_norm[:, idx_e])
+                    te_cols.append(stat_test_norm[:, idx_e])
+                elif fname.startswith("bio_pls_"):
+                    comp_i = int(fname.split("_")[-1]) - 1
+                    tr_cols.append(z_train_norm[:, actual_vis_comps + comp_i])
+                    te_cols.append(z_test_norm[:, actual_vis_comps + comp_i])
+            X_train_vital = np.column_stack(tr_cols).astype(np.float32)
+            X_test_vital = np.column_stack(te_cols).astype(np.float32)
+        else:
+            X_train_vital = X_train_full[:, vital_indices].astype(np.float32)
+            X_test_vital = X_test_full[:, vital_indices].astype(np.float32)
 
         # E. Early Stopping 用の Fold 内 Train / Val 分割 (被験者単位 GroupShuffleSplit 優先)
         n_tr = len(train_idx)

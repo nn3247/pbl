@@ -55,7 +55,7 @@ class RandomForestBaseRegressor(BaseModalityRegressor):
         early_stopping_rounds: Optional[int] = None,
         feature_names: Optional[List[str]] = None,
     ) -> "RandomForestBaseRegressor":
-        X_tr = np.asarray(X_train, dtype=np.float32)
+        X_tr = np.nan_to_num(np.asarray(X_train, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
         y_tr = np.asarray(y_train, dtype=np.float64)
         self.feature_names = (
             list(feature_names)
@@ -75,7 +75,7 @@ class RandomForestBaseRegressor(BaseModalityRegressor):
         rf_kwargs.pop("early_stopping_rounds", None)
 
         if X_val is not None and y_val is not None and stop_rounds > 0 and max_trees > step_trees:
-            X_v = np.asarray(X_val, dtype=np.float32)
+            X_v = np.nan_to_num(np.asarray(X_val, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
             y_v = np.asarray(y_val, dtype=np.float64)
 
             rf_kwargs["warm_start"] = True
@@ -120,6 +120,10 @@ class RandomForestBaseRegressor(BaseModalityRegressor):
             self.best_iteration_ = max_trees
 
         return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        X_clean = np.nan_to_num(np.asarray(X, dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+        return super().predict(X_clean)
 
     def get_feature_importance(
         self,

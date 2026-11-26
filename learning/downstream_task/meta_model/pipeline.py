@@ -4,8 +4,11 @@
 """
 
 from __future__ import annotations
+import argparse
+import copy
 import logging
 from pathlib import Path
+import re
 import sys
 import time
 from typing import Dict, List, Optional, Sequence
@@ -73,28 +76,95 @@ class MetaModelPipeline:
         self.output_dir = model_root / self.window_size / "meta_model"
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
+    def _resolve_best_base_model(self, modality: str) -> str:
+        """
+        base_model 評価結果（base_models_comparison.csv / {modality}_models_comparison.csv / report.md）から
+        最高 ROC-AUC のモデル名を自動取得します。未生成の場合は BaseModelPipeline を自動実行します。
+        """
+        mod_key = modality.lower().strip()
+        mod_csv = self.base_model_dir / mod_key / f"{mod_key}_models_comparison.csv"
+        all_csv = self.base_model_dir / "base_models_comparison.csv"
+        report_md = self.base_model_dir / "report.md"
+
+        def _pick_from_csv() -> tuple[Optional[str], Optional[float]]:
+            df_sub = pd.DataFrame()
+            if mod_csv.exists():
+                df_sub = pd.read_csv(mod_csv)
+            elif all_csv.exists():
+                df_all = pd.read_csv(all_csv)
+                if "modality" in df_all.columns:
+                    df_sub = df_all[df_all["modality"].astype(str).str.lower() == mod_key]
+            if not df_sub.empty and "model" in df_sub.columns and "roc_auc" in df_sub.columns:
+                valid = df_sub[df_sub["roc_auc"].notna()]
+                if not valid.empty:
+                    best_row = valid.loc[valid["roc_auc"].idxmax()]
+                    return str(best_row["model"]), float(best_row["roc_auc"])
+            return None, None
+
+        def _pick_from_report() -> Optional[str]:
+            if not report_md.exists():
+                return None
+            text = report_md.read_text(encoding="utf-8")
+            m = re.search(rf"最高 ROC-AUC モデル \({re.escape(mod_key)}\)\*\*:\s*`([^`]+)`", text)
+            if m:
+                return m.group(1).strip()
+            return None
+
+        best_model, best_auc = _pick_from_csv()
+        if best_model is None:
+            best_model = _pick_from_report()
+
+        if best_model is None:
+            log.info(
+                f"ℹ️ [{mod_key.upper()}] base_model 比較結果が見つからないため、"
+                f"先に BaseModelPipeline で全ベースモデルを評価します..."
+            )
+            BaseModelPipeline(self.cfg).run(modalities=[mod_key])
+            best_model, best_auc = _pick_from_csv()
+            if best_model is None:
+                best_model = _pick_from_report()
+
+        if best_model is None:
+            log.warning(f"⚠️ [{mod_key.upper()}] 最高モデルの特定に失敗したため 'lightgbm' にフォールバックします。")
+            return "lightgbm"
+
+        auc_msg = f" (ROC-AUC={best_auc:.4f})" if best_auc is not None else " (from report.md)"
+        log.info(f"🏆 [{mod_key.upper()}] base_model 最高モデルを自動選択しました: '{best_model}'{auc_msg}")
+        return normalize_base_model_name(best_model)
+
     def _resolve_selected_base_models(
         self,
         visual_model: Optional[str] = None,
         vital_model: Optional[str] = None,
     ) -> tuple[str, str]:
-        """config.yaml または引数から採用する visual / vital ベースモデル名を解決します"""
+        """config.yaml または引数から採用する visual / vital ベースモデル名を解決します ('auto' で最高モデル自動選択)"""
         selected_cfg = self.meta_model_cfg.get("selected_base_models", {})
         vis_raw = (
             visual_model
             or selected_cfg.get("visual")
             or self.meta_model_cfg.get("visual_model")
             or self.downstream_cfg.get("visual_base_model")
-            or "lightgbm"
+            or "auto"
         )
         vit_raw = (
             vital_model
             or selected_cfg.get("vital")
             or self.meta_model_cfg.get("vital_model")
             or self.downstream_cfg.get("vital_base_model")
-            or "lightgbm"
+            or "auto"
         )
-        return normalize_base_model_name(vis_raw), normalize_base_model_name(vit_raw)
+
+        vis_resolved = (
+            self._resolve_best_base_model("visual")
+            if str(vis_raw).lower().strip() in ("auto", "best")
+            else normalize_base_model_name(vis_raw)
+        )
+        vit_resolved = (
+            self._resolve_best_base_model("vital")
+            if str(vit_raw).lower().strip() in ("auto", "best")
+            else normalize_base_model_name(vit_raw)
+        )
+        return vis_resolved, vit_resolved
 
     def _load_or_build_base_oof(
         self,
